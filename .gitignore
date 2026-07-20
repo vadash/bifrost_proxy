@@ -6,3 +6,5 @@
 .beads/proxieddb/
 # Sidecar capture output (runtime data, not source)
 sidecar/capture.jsonl
+# Python bytecode (runtime, not source)
+__pycache__/
