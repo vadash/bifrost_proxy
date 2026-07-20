@@ -72,7 +72,15 @@ Expect 200, **no** `x-sidecar-*` headers, **no** new `sidecar.log` line
 
 ### Streaming
 Add `"stream":true` to pooled request → incremental `data:` SSE events,
-`sidecar.log` still records `served`/`is_fallback`.
+`sidecar.log` still records `served`/`fell_back`.
+
+### Unit tests (no live Bifrost needed)
+```cmd
+python -m unittest sidecar.tests.test_routing -v
+```
+Stdlib `unittest` only. Covers `build_send_order` (send-order + desperate),
+`fallback_feedback` (re-pin + first-skipped cooldown on 2xx fallback), cooldown
+regression, and cold-start pin spread. Run before committing routing changes.
 
 ## sidecar.log record shape
 
@@ -80,7 +88,7 @@ Add `"stream":true` to pooled request → incremental `data:` SSE events,
 {"ts":"...","session":"<key[:12]>","source":"cache_key|prev_resp|hash",
  "pin":<idx>,"primary":"nvidia-7","ring":["nvidia-7","nvidia-8",...],
  "cooldowns":["nvidia-1"],"served":"nvidia-8","is_fallback":true,
- "repin":"nvidia-8|null","status":200,"desperate":false}
+ "fell_back":true,"repin":"nvidia-8|null","status":200,"desperate":false}
 ```
 
 ## Files
@@ -92,3 +100,4 @@ Add `"stream":true` to pooled request → incremental `data:` SSE events,
 | `start_sidecar.cmd` | Repo-root launcher (`python -m sidecar`) |
 | `sidecar/sidecar.log` | Decision log (pooled only, gitignored) |
 | `sidecar/capture.jsonl` | Raw capture (pooled only, gitignored; **off by default — add `--capture`**) |
+| `sidecar/tests/test_routing.py` | Stdlib `unittest` for `build_send_order`/`fallback_feedback`/cooldowns/cold-start (see Verify) |

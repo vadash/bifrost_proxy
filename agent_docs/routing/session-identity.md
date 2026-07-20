@@ -30,7 +30,9 @@ Two real subagent sessions (Bun `User-Agent`, `POST /v1/responses`):
 
 Pin is **least-loaded start**, not `sha256 % N` (that formula was an earlier
 design, superseded). First time session seen → pin to non-cooled provider with
-fewest live pinned sessions, tie → lowest index. See `proxy.py` `assign_pin`.
+fewest live pinned sessions; tie → uniform-random choice (not lowest index) so
+a fresh pool doesn't stampede every session onto `nvidia-1` on cold start. See
+`state.py` `RoutingState.assign_pin` (random tie-break via `self._rng`).
 
 ## Why this matters
 

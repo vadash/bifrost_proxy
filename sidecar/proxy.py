@@ -22,7 +22,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from .config import HOP_BY_HOP, SidecarConfig
 from .io_jsonl import JsonlWriter, parse_request_body, redact_headers
 from .meta import parse_response_meta_nonstream, parse_response_meta_stream
-from .state import RoutingState
+from .state import RoutingState, fallback_feedback
 
 
 class Sidecar(ThreadingHTTPServer):
@@ -121,12 +121,12 @@ class Handler(BaseHTTPRequestHandler):
         state = self._state
         now_fb = time.time()
         served = None
-        primary = None
-        is_fallback = None
         if isinstance(routing_info, dict) and routing_info:
             served = routing_info.get("provider")
-            primary = routing_info.get("primary_provider")
-            is_fallback = routing_info.get("is_fallback")
+
+        repin_to, cool_provider = fallback_feedback(
+            keep_list, served, response_status
+        )
 
         with state.lock():
             state.purge_expired(now_fb)
@@ -135,25 +135,18 @@ class Handler(BaseHTTPRequestHandler):
                 or (response_status is not None and response_status >= 500)
                 or (response_status == 429)
             )
-            if (
-                response_status is not None
-                and 200 <= response_status < 300
-                and is_fallback
-                and served is not None
-                and primary is not None
-                and served != primary
-            ):
-                # Bifrost walked to a fallback -> primary failed downstream.
-                state.cooldown_trigger(primary, now_fb)
-                # Re-pin: follow the provider that actually served.
-                state.re_pin(session_key, served, providers, now_fb)
+            if repin_to is not None:
+                # Bifrost walked to a fallback -> cool the first skipped
+                # provider (stampede target); follow the server that answered.
+                if cool_provider is not None:
+                    state.cooldown_trigger(cool_provider, now_fb)
+                state.re_pin(session_key, repin_to, providers, now_fb)
             elif err_path:
-                # Cool the primary we forced; advance pin one step.
+                # Whole chain failed: cool the forced primary; advance one step.
                 state.cooldown_trigger(keep_list[0], now_fb)
                 if len(keep_list) > 1:
                     state.re_pin(session_key, keep_list[1], providers, now_fb)
 
-            # Map response id -> session for future prev_response_id lookups.
             if response_id is not None:
                 state.map_response(response_id, session_key, now_fb)
 
@@ -198,6 +191,11 @@ class Handler(BaseHTTPRequestHandler):
         if isinstance(routing_info, dict) and routing_info:
             served = routing_info.get("provider")
             is_fallback_val = routing_info.get("is_fallback")
+        fell_back = (
+            served is not None
+            and bool(keep_list)
+            and served != keep_list[0]
+        )
         # Reconstruct repin from pin/served for observability.
         now_log = time.time()
         with state.lock():
@@ -222,6 +220,7 @@ class Handler(BaseHTTPRequestHandler):
             "cooldowns": hot,
             "served": served,
             "is_fallback": is_fallback_val,
+            "fell_back": fell_back,
             "repin": repin,
             "status": response_status,
             "desperate": desperate,
@@ -247,7 +246,6 @@ class Handler(BaseHTTPRequestHandler):
         providers = None          # the pooled model's provider-name list
         pin = None
         keep_list = None          # kept[] ring used in the request + step-8 feedback
-        kept = None
         desperate = False
 
         try:
@@ -285,24 +283,16 @@ class Handler(BaseHTTPRequestHandler):
                     )
                     pin = state.assign_pin(session_key, providers, now)
 
-                    # Ring: rotate starting at the pinned provider.
-                    ring_names = list(providers[pin:]) + list(providers[:pin])
-                    kept = [
-                        p for p in ring_names
-                        if not state.cooldown_is_hot(p, now)
-                    ]
-                    if not kept:
-                        desperate = True
-                        kept = list(ring_names)  # full ring, request still goes out
-                    keep_list = list(kept)
+                    # Full ring: cold providers first, hot ones appended last.
+                    keep_list, desperate = state.build_send_order(
+                        providers, pin, now
+                    )
 
                     # Rewrite request body dict: model -> "primary/pooled",
                     # fallbacks -> rest.
-                    request_body_parsed["model"] = (
-                        f"{kept[0]}/{pooled_model}"
-                    )
+                    request_body_parsed["model"] = f"{keep_list[0]}/{pooled_model}"
                     request_body_parsed["fallbacks"] = [
-                        f"{p}/{pooled_model}" for p in kept[1:]
+                        f"{p}/{pooled_model}" for p in keep_list[1:]
                     ]
                     new_body = json.dumps(request_body_parsed).encode("utf-8")
                     forward_body = new_body

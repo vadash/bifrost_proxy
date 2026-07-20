@@ -22,6 +22,7 @@ immutable source of truth.
 
 from __future__ import annotations
 
+import random
 import threading
 import time
 
@@ -39,11 +40,12 @@ class RoutingState:
     old ``STATE_LOCK`` gave, now explicit and local to this object.
     """
 
-    __slots__ = ("_cfg", "_lock", "pins", "resp_map", "cooldowns", "pools")
+    __slots__ = ("_cfg", "_lock", "_rng", "pins", "resp_map", "cooldowns", "pools")
 
     def __init__(self, cfg: SidecarConfig):
         self._cfg = cfg
         self._lock = threading.Lock()
+        self._rng = random.Random()
         self.pins: dict[str, dict] = {}
         self.resp_map: dict[str, dict] = {}
         self.cooldowns: dict[str, float] = {}
@@ -114,9 +116,11 @@ class RoutingState:
         """Return the pinned provider index for ``session_key``.
 
         If known, refresh ``seen`` and return the stored pin; else compute
-        least-loaded start (fewest live pinned sessions, tie -> lowest
-        index, skipping hot providers; if all hot, fall back to all
-        indices). Store + return the pin. Must be called under ``self.lock()``.
+        least-loaded start: fewest live pinned sessions among cold providers,
+        tie -> uniform-random choice (so a fresh pool doesn't stampede every
+        session onto the lowest-index provider on cold start); if all hot,
+        fall back to all indices. Store + return the pin. Must be called
+        under ``self.lock()``.
         """
         if session_key in self.pins:
             self.pins[session_key]["seen"] = now
@@ -136,7 +140,9 @@ class RoutingState:
         if not candidates:
             # desperate: all hot, still land somewhere
             candidates = list(range(len(providers)))
-        pin = min(candidates, key=lambda i: (load[i], i))
+        min_load = min(load[i] for i in candidates)
+        tied = [i for i in candidates if load[i] == min_load]
+        pin = tied[0] if len(tied) == 1 else self._rng.choice(tied)
         self.pins[session_key] = {"pin": pin, "seen": now}
         return pin
 
@@ -153,6 +159,21 @@ class RoutingState:
                 "seen": now,
             }
 
+    def build_send_order(
+        self, providers: list[str], pin: int, now: float
+    ) -> tuple[list[str], bool]:
+        """Return ``(send_order, desperate)`` for a pooled request.
+
+        Rotate ``providers`` to start at ``pin``; keep the WHOLE ring but move
+        providers currently in cooldown to the END so Bifrost only reaches them
+        as a last resort. ``desperate`` is True iff no cold provider exists.
+        Must be called under ``self.lock()`` (reads ``cooldowns``).
+        """
+        ring = list(providers[pin:]) + list(providers[:pin])
+        cold = [p for p in ring if not self.cooldown_is_hot(p, now)]
+        hot = [p for p in ring if self.cooldown_is_hot(p, now)]
+        return cold + hot, not cold
+
     def map_response(self, response_id: str, session_key: str, now: float) -> None:
         """Record ``response_id -> session`` for future prev-id lookups.
 
@@ -164,3 +185,31 @@ class RoutingState:
     def is_pooled(self, model: str | None) -> bool:
         """True iff ``model`` is declared as a pool key in pools.json."""
         return model is not None and model in self.pools
+
+
+def fallback_feedback(
+    keep_list: list[str] | None,
+    served: str | None,
+    response_status: int | None,
+) -> tuple[str | None, str | None]:
+    """Decide the post-response action for the 2xx fallback path.
+
+    Returns ``(repin_to, cooldown_provider)``:
+    * ``repin_to`` — provider to re-pin the session to (the server that
+      actually answered) iff Bifrost fell back off the forced primary, i.e.
+      status is 2xx and ``served`` differs from the primary we sent
+      (``keep_list[0]``). ``is_fallback`` from routing_info is intentionally
+      NOT consulted — served-vs-forced-primary is the real signal.
+    * ``cooldown_provider`` — the first provider AFTER the primary
+      (``keep_list[1]``) iff it was actually skipped (``served`` is neither
+      ``keep_list[0]`` nor ``keep_list[1]``); else ``None`` (never cool a
+      provider that served).
+    """
+    if response_status is None or not (200 <= response_status < 300):
+        return None, None
+    if not keep_list or served is None or served == keep_list[0]:
+        return None, None
+    cooldown_provider = None
+    if len(keep_list) > 1 and served != keep_list[1]:
+        cooldown_provider = keep_list[1]
+    return served, cooldown_provider
