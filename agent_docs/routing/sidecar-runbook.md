@@ -1,15 +1,16 @@
 # Sidecar Runbook
 
-Run + verify Bifrost routing sidecar (v2, Bifrost-tfz).
+Run + verify Bifrost routing sidecar (v2.1, Bifrost-tfz).
 
 ## What it is
 
-Stdlib (`ThreadingHTTPServer` + `http.client`) proxy at `sidecar/proxy.py`.
-Listens `127.0.0.1:8088` → Bifrost `127.0.0.1:8080`.
+Stdlib (`ThreadingHTTPServer` + `http.client`) proxy package at `sidecar/`
+(run with `python -m sidecar`). Listens `127.0.0.1:8088` → Bifrost `127.0.0.1:8080`.
 
 Pooled models (`sidecar/pools.json` keys): rewrite `model` → `provider/model`,
 own `fallbacks` array, pin session to least-loaded provider, cool down failures
-globally, log to `sidecar/sidecar.log` + `sidecar/capture.jsonl` (pooled only).
+globally, log to `sidecar/sidecar.log`. `sidecar/capture.jsonl` is recorded
+only when `--capture` is passed (off by default).
 
 Non-pooled models: verbatim passthrough, no state, no headers, no logs —
 indistinguishable from hitting Bifrost directly.
@@ -24,14 +25,19 @@ indistinguishable from hitting Bifrost directly.
 ## Start
 
 ```cmd
-python sidecar\proxy.py
+python -m sidecar
+```
+
+With raw capture (records `sidecar/capture.jsonl`):
+```cmd
+python -m sidecar --capture
 ```
 
 Or hub:
 ```json
 {"op":"start","name":"sidecar",
  "application":"C:\\Users\\vadash\\AppData\\Local\\Python\\pythoncore-3.14-64\\python.exe",
- "args":["sidecar/proxy.py"],"cwd":"C:/projects/_llm/Bifrost",
+ "args":["-m","sidecar"],"cwd":"C:/projects/_llm/Bifrost",
  "ready":{"log":"listening on","timeout":30}}
 ```
 
@@ -60,8 +66,9 @@ Repeat `sess-A` request → same `x-sidecar-pin`.
 ```cmd
 curl.exe -s -D - -X POST http://127.0.0.1:8088/v1/chat/completions -H "Content-Type: application/json" -d "{\"model\":\"poolside/laguna-xs-2.1\",\"messages\":[{\"role\":\"user\",\"content\":\"ping\"}]}"
 ```
-Expect 200, **no** `x-sidecar-*` headers, **no** new `sidecar.log` or
-`capture.jsonl` line (transparent passthrough).
+Expect 200, **no** `x-sidecar-*` headers, **no** new `sidecar.log` line
+(transparent passthrough). `capture.jsonl` is never written unless
+`--capture` was passed, and even then only for pooled requests.
 
 ### Streaming
 Add `"stream":true` to pooled request → incremental `data:` SSE events,
@@ -80,8 +87,8 @@ Add `"stream":true` to pooled request → incremental `data:` SSE events,
 
 | File | Purpose |
 |---|---|
-| `sidecar/proxy.py` | Proxy (stdlib, single file) |
+| `sidecar/` | Proxy package (stdlib; `__main__.py` entrypoint) |
 | `sidecar/pools.json` | Pooled models → ordered provider list |
-| `start_sidecar.cmd` | Repo-root launcher |
+| `start_sidecar.cmd` | Repo-root launcher (`python -m sidecar`) |
 | `sidecar/sidecar.log` | Decision log (pooled only, gitignored) |
-| `sidecar/capture.jsonl` | Raw capture (pooled only, gitignored) |
+| `sidecar/capture.jsonl` | Raw capture (pooled only, gitignored; **off by default — add `--capture`**) |

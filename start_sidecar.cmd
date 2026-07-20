@@ -14,4 +14,5 @@ if not errorlevel 1 (
 )
 
 echo Repoint your client baseUrl to http://%LISTEN%/v1  ^(Bifrost stays on :8080^)
-python "%~dp0sidecar\proxy.py"
+cd /d "%~dp0"
+python -m sidecar
