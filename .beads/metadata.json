@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "Bifrost",
+  "project_id": "d4dcf218-5431-465a-a094-ebeb5dbc38b1"
+}
