@@ -1,72 +1,39 @@
 # Session Identity Derivation
 
-How the sidecar identifies which "session" a request belongs to, and the
-ground-truth discovery (from the v1 passthrough capture) that corrected the
-original design assumption.
+How sidecar derives which "session" a request belongs to. Ground truth from v1
+passthrough capture (`sidecar/capture.jsonl`, 2026-07-20).
 
-## The original assumption (from the Bifrost-0xc epic)
+## What capture showed
 
-The cascade was planned as:
+Two real subagent sessions (Bun `User-Agent`, `POST /v1/responses`):
 
-1. `previous_response_id` present → look up sidecar's `resp_id → session` map;
-   reuse that session (handles multi-turn chains that omit earlier turns).
-2. Else → hash(instructions + first user-turn text) → session_key. Sticky
-   thereafter.
-3. Map the returned response id → session_key for future
-   `previous_response_id` lookups.
+- **All entries `has_previous_response_id == false`.** `previous_response_id`
+  never set in any subagent request — not first turn, not continuation.
+- Continuation re-sends prior turns inline in `input` array (sliding window).
+  Array grows `len 1` → `len 3` / `len 4` (`[user, assistant, user, user]`).
+- **Session identity carried by `prompt_cache_key`** — stable UUID per
+  subagent session, present every request body. Two distinct UUIDs observed
+  (one per subagent), constant across each session's turns.
 
-## What the capture actually showed (v1 passthrough, 2026-07-20)
+## v2 cascade (shipped)
 
-Two real subagent sessions (Bun `User-Agent`, `POST /v1/responses`) drove the
-sidecar. The capture (`sidecar/capture.jsonl`) showed:
+`derive_session_key(body) -> (session_key, source)`, first match wins:
 
-- **All 12 entries had `has_previous_response_id == false`.** The
-  `previous_response_id` field was **never** set in any subagent request —
-  not on the first turn, not on continuation turns.
-- **Continuation is done by re-sending prior turns inline in the `input`
-  array.** The `input` array grew from `len 1` (initial `"SESSION NUMBA ONE"`)
-  to `len 3` / `len 4` on follow-up turns: `[user, assistant, user, user]`.
-  The client is a "sliding window" — it re-sends the conversation history each
-  turn rather than chaining via `previous_response_id`.
-- **Session identity is carried by `prompt_cache_key`**, a stable UUID per
-  subagent session present in every request body. Two distinct UUIDs were
-  observed (one per subagent), constant across all of each session's turns.
+1. `body.prompt_cache_key` truthy → `(str(that), "cache_key")`.
+2. `body.previous_response_id` present AND found in `RESP_MAP` →
+   `(RESP_MAP[id].session, "prev_resp")`. Kept for completeness, not observed
+   in practice.
+3. Hash fallback → `("h:" + sha256(instructions + "\n" + first_user_text)[:32],
+   "hash")`. For clients sending neither.
 
-### Evidence
+## Pin assignment (NOT hash)
 
-Session A — `019f805d-7c0e-7000-815a-7a17eb819c97`:
-| ts | input len | roles | previous_response_id |
-|---|---|---|---|
-| 19:36:28 | 1 | `[user]` | None |
-| 19:42:40 | 4 | `[user, assistant, user, user]` | None |
-| 19:43:53 | 3 | `[user, assistant, user]` | None |
+Pin is **least-loaded start**, not `sha256 % N` (that formula was an earlier
+design, superseded). First time session seen → pin to non-cooled provider with
+fewest live pinned sessions, tie → lowest index. See `proxy.py` `assign_pin`.
 
-Session B — `019f805d-8698-7000-9725-e41965101481`:
-| ts | input len | roles | previous_response_id |
-|---|---|---|---|
-| 19:36:32 | 1 | `[user]` | None |
-| 19:42:38 | 4 | `[user, assistant, user, user]` | None |
-| 19:43:59 | 3 | `[user, assistant, user]` | None |
+## Why this matters
 
-## Corrected derivation (for v2 sidecar, Bifrost-tfz)
-
-Session identity should be derived from `prompt_cache_key` first — it is the
-field the client actually uses to mark a session. The cascade becomes:
-
-1. `prompt_cache_key` present in request body → use it directly as the
-   session_key. (Verified stable across continuation turns.)
-2. Fallback: `previous_response_id` present → sidecar's `resp_id → session` map.
-   (Kept for completeness; not observed in practice but cheap to support.)
-3. Fallback: hash(instructions + first user-turn text) → session_key.
-   (For clients that send neither cache key nor previous_response_id.)
-
-Pin = `sha256(session_key)[:8]` interpreted little-endian `% N` (N = provider
-count). Same key → same pin across restarts.
-
-## Why this matters for routing
-
-The whole point of the sidecar is per-session provider pinning for
-prompt-cache locality. If session identity is wrong, two different sessions
-get pinned to the same provider (cache thrash) or one session's pins scatter
-across providers (no cache benefit). `prompt_cache_key` is the reliable signal
-the client already provides.
+Per-session provider pinning = prompt-cache locality. Wrong session identity →
+two sessions same provider (cache thrash) or one session scattered (no benefit).
+`prompt_cache_key` is reliable signal client already provides.

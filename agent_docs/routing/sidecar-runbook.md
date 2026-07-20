@@ -1,136 +1,87 @@
 # Sidecar Runbook
 
-How to run, verify, and use the Bifrost capture sidecar (v1, Bifrost-kh0).
+Run + verify Bifrost routing sidecar (v2, Bifrost-tfz).
 
 ## What it is
 
-A Python stdlib (`ThreadingHTTPServer` + `http.client`) passthrough proxy at
-`sidecar/proxy.py`. It listens on `127.0.0.1:8088`, forwards every request
-verbatim to Bifrost on `127.0.0.1:8080` (streaming and non-streaming), and
-appends one JSON line per request to `sidecar/capture.jsonl` with redacted
-headers, parsed request body, response status, and `routing_info`. No routing
-or rewriting — observe only.
+Stdlib (`ThreadingHTTPServer` + `http.client`) proxy at `sidecar/proxy.py`.
+Listens `127.0.0.1:8088` → Bifrost `127.0.0.1:8080`.
+
+Pooled models (`sidecar/pools.json` keys): rewrite `model` → `provider/model`,
+own `fallbacks` array, pin session to least-loaded provider, cool down failures
+globally, log to `sidecar/sidecar.log` + `sidecar/capture.jsonl` (pooled only).
+
+Non-pooled models: verbatim passthrough, no state, no headers, no logs —
+indistinguishable from hitting Bifrost directly.
 
 ## Prerequisites
 
 - Python 3.14 at `C:\Users\vadash\AppData\Local\Python\pythoncore-3.14-64\python.exe`
-  (stdlib only; no pip packages needed).
-- Bifrost running on `127.0.0.1:8080`.
-- `curl.exe` at `C:\Windows\System32\curl.exe` (for verification).
+  (stdlib only).
+- Bifrost on `127.0.0.1:8080`.
+- `curl.exe` for verify.
 
-## Start the sidecar
-
-### From a terminal
+## Start
 
 ```cmd
-C:\projects\_llm\_llm\Bifrost\start_sidecar.cmd
+python sidecar\proxy.py
 ```
 
-Or directly:
+Or hub:
+```json
+{"op":"start","name":"sidecar",
+ "application":"C:\\Users\\vadash\\AppData\\Local\\Python\\pythoncore-3.14-64\\python.exe",
+ "args":["sidecar/proxy.py"],"cwd":"C:/projects/_llm/Bifrost",
+ "ready":{"log":"listening on","timeout":30}}
+```
+
+Banner: `[sidecar] listening on http://127.0.0.1:8088 -> http://127.0.0.1:8080
+pooled_models=N ...`. Edit `pools.json` requires restart (startup-only load).
+
+## Repoint client
+
+Base URL `http://127.0.0.1:8080/v1` → `http://127.0.0.1:8088/v1`. Bifrost
+unchanged.
+
+## Verify
+
+### Pooled: least-loaded + distinct
 ```cmd
-python C:\projects\_llm\_llm\Bifrost\sidecar\proxy.py
+curl.exe -s -D - -X POST http://127.0.0.1:8088/v1/chat/completions -H "Content-Type: application/json" -d "{\"model\":\"z-ai/glm-5.2\",\"prompt_cache_key\":\"sess-A\",\"messages\":[{\"role\":\"user\",\"content\":\"ping\"}]}"
+curl.exe -s -D - -X POST http://127.0.0.1:8088/v1/chat/completions -H "Content-Type: application/json" -d "{\"model\":\"z-ai/glm-5.2\",\"prompt_cache_key\":\"sess-B\",\"messages\":[{\"role\":\"user\",\"content\":\"ping\"}]}"
 ```
+Expect 200, different `x-sidecar-pin` values, `x-sidecar-session` = first 12
+chars of key. `sidecar.log` two lines, distinct `primary`.
 
-Expected banner:
-```
-[sidecar] listening on http://127.0.0.1:8088 -> http://127.0.0.1:8080  capture=...\sidecar\capture.jsonl
-```
+### Stickiness
+Repeat `sess-A` request → same `x-sidecar-pin`.
 
-### Via the agent hub (long-running background process)
+### Non-pooled passthrough
+```cmd
+curl.exe -s -D - -X POST http://127.0.0.1:8088/v1/chat/completions -H "Content-Type: application/json" -d "{\"model\":\"poolside/laguna-xs-2.1\",\"messages\":[{\"role\":\"user\",\"content\":\"ping\"}]}"
+```
+Expect 200, **no** `x-sidecar-*` headers, **no** new `sidecar.log` or
+`capture.jsonl` line (transparent passthrough).
+
+### Streaming
+Add `"stream":true` to pooled request → incremental `data:` SSE events,
+`sidecar.log` still records `served`/`is_fallback`.
+
+## sidecar.log record shape
 
 ```json
-{
-  "op": "start",
-  "name": "sidecar",
-  "application": "C:\\Users\\vadash\\AppData\\Local\\Python\\pythoncore-3.14-64\\python.exe",
-  "args": ["C:/projects/_llm/Bifrost/sidecar/proxy.py"],
-  "cwd": "C:/projects/_llm/Bifrost",
-  "ready": {"log": "listening on", "timeout": 15}
-}
+{"ts":"...","session":"<key[:12]>","source":"cache_key|prev_resp|hash",
+ "pin":<idx>,"primary":"nvidia-7","ring":["nvidia-7","nvidia-8",...],
+ "cooldowns":["nvidia-1"],"served":"nvidia-8","is_fallback":true,
+ "repin":"nvidia-8|null","status":200,"desperate":false}
 ```
-
-## Repoint the client
-
-Change the client's base URL from `http://127.0.0.1:8080/v1` to
-`http://127.0.0.1:8088/v1`. Bifrost stays on :8080 unchanged.
-
-## Verify (5 checks)
-
-### 1. Sidecar starts clean
-Hub `logs name="sidecar"` shows the `listening on http://127.0.0.1:8088`
-banner with no traceback.
-
-### 2. Non-stream passthrough + capture
-```cmd
-curl.exe -s -X POST http://127.0.0.1:8088/v1/chat/completions ^
-  -H "Content-Type: application/json" ^
-  -H "Authorization: Bearer test-key-should-not-appear" ^
-  -d "{\"model\":\"z-ai/glm-5.2\",\"messages\":[{\"role\":\"user\",\"content\":\"ping\"}]}"
-```
-Expect: curl returns a valid completion. Last line of `capture.jsonl`:
-`request_headers.Authorization == "REDACTED"`,
-`request_body.model == "z-ai/glm-5.2"`,
-`streaming == false`, `routing_info` populated.
-
-### 3. Streaming passthrough
-Same curl with `"stream":true` added. Expect: curl emits incremental `data:`
-SSE events (not one buffered blob); capture line has `streaming == true` and
-non-null `routing_info` from the terminal event.
-
-### 4. Redaction never leaks upstream
-All test requests returned 200 (not 401) — the real `Authorization` reached
-Bifrost. Only the **capture** is redacted.
-
-### 5. Concurrency
-Two overlapping `curl.exe` calls both complete and both produce well-formed
-(non-interleaved) capture lines. `ThreadingHTTPServer` + `CAPTURE_LOCK`
-handle parallel subagents.
-
-## Analyze the capture log
-
-```python
-import json
-lines = [l for l in open("sidecar/capture.jsonl", encoding="utf-8").read().splitlines() if l]
-records = [json.loads(l) for l in lines]
-# count, group by method/path, tabulate routing_info.provider, check has_previous_response_id
-```
-
-See `session-identity.md` for the analysis that revealed `prompt_cache_key` is
-the real session identifier.
-
-## Capture record shape
-
-```json
-{
-  "ts": "2026-07-20T19:36:28.953730",
-  "method": "POST",
-  "path": "/v1/responses",
-  "request_headers": {"Authorization": "REDACTED", "...": "..."},
-  "request_body": {"model": "...", "input": [...], "instructions": "...", "...": "..."},
-  "has_previous_response_id": false,
-  "response_status": 200,
-  "streaming": true,
-  "routing_info": {"provider": "nvidia-3", "key": "NVIDIA_API_KEY_13", "is_fallback": true}
-}
-```
-
-- `request_headers` — redacted (`authorization`, `x-api-key`, `apikey`,
-  `api-key` → `"REDACTED"`).
-- `request_body` — parsed JSON kept whole (model/messages/instructions visible);
-  non-JSON bodies truncated to 4 KB.
-- `routing_info` — extracted from response `extra_fields.routing_info`
-  (non-stream body / streaming terminal SSE event). `null` on error.
 
 ## Files
 
 | File | Purpose |
 |---|---|
-| `sidecar/proxy.py` | The proxy (single file, stdlib only) |
-| `start_sidecar.cmd` | Repo-root launcher (`%~dp0` style) |
-| `sidecar/capture.jsonl` | Capture output (gitignored, runtime data) |
-
-## Commit
-
-`704c1d5` — "Add Bifrost passthrough capture sidecar (Bifrost-kh0)" — added
-`sidecar/proxy.py`, `start_sidecar.cmd`, appended `sidecar/capture.jsonl` to
-`.gitignore`. File-scoped `git add` (no `git add .`).
+| `sidecar/proxy.py` | Proxy (stdlib, single file) |
+| `sidecar/pools.json` | Pooled models → ordered provider list |
+| `start_sidecar.cmd` | Repo-root launcher |
+| `sidecar/sidecar.log` | Decision log (pooled only, gitignored) |
+| `sidecar/capture.jsonl` | Raw capture (pooled only, gitignored) |

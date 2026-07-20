@@ -5,7 +5,10 @@ fallback behavior. Every fact here was confirmed by curl against a running
 Bifrost v1.6.4 on `127.0.0.1:8080` (2026-07-20) and/or by reading Bifrost
 source at `C:/temp/bifrost-source-read-only`.
 
-This is the ground truth the sidecar routing logic (Bifrost-tfz) must build on.
+This is the ground truth the sidecar routing logic (Bifrost-tfz) builds on.
+The `provider/model` prefix + body `fallbacks` array mechanism below is
+actively used by sidecar v2 (`sidecar/proxy.py`) to pin primaries and own the
+fallback order.
 
 ## Setup
 

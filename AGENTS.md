@@ -5,7 +5,7 @@ providers for prompt-cache locality. Uses **bd (beads)** for issue tracking.
 
 ## Repository map
 
-- `sidecar/proxy.py` — stdlib passthrough capture proxy (v1, Bifrost-kh0). Listens on :8088, forwards to Bifrost :8080, logs every request to `sidecar/capture.jsonl`.
+- `sidecar/proxy.py` — stdlib routing proxy (v2, Bifrost-tfz). Listens on :8088, forwards to Bifrost :8080. Pooled models (declared in `sidecar/pools.json`) get session-pinned provider + cooldown routing; non-pooled models pass through verbatim. Logs pooled-only to `sidecar/sidecar.log` + `sidecar/capture.jsonl`.
 - `start_sidecar.cmd` — repo-root launcher for the sidecar.
 - `start_bifrost.cmd` — launcher for Bifrost itself (npx, port 8080).
 - `agent_docs/routing/` — **verified routing mechanics, session-identity derivation, sidecar runbook**. Read [`agent_docs/routing/README.md`](agent_docs/routing/README.md) before touching anything routing-related.
