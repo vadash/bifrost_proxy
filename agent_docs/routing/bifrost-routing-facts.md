@@ -12,7 +12,7 @@ fallback order.
 
 ## Setup
 
-- 10 nvidia providers registered in the Bifrost web UI: `nvidia-1` ... `nvidia-10`.
+- 15 nvidia providers registered in the Bifrost web UI: `nvidia-1` ... `nvidia-15`. (Earlier v1 sessions used 10; the alpha-sort bug below is unaffected by the count.)
 - Each backs the same model string `z-ai/glm-5.2` (the pooled model).
 - Non-pooled models (e.g. `poolside/laguna-xs-2.1`) pass through untouched.
 

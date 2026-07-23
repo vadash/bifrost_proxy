@@ -4,7 +4,7 @@ Bifrost sidecar: pin each session to deterministic provider for prompt-cache
 locality. Fixes Bifrost alpha-sort (every request starts `nvidia-1`, walks
 `nvidia-1, nvidia-10, nvidia-2, ...` lexicographic not numeric).
 
-Status: **v2 shipped (Bifrost-tfz)**. Session-pinned routing with global
+Status: **v2.2 (Bifrost-tfz)**. Session-pinned routing with global
 cooldown; send-order/feedback logic lives in pure helpers in `state.py`
 (`build_send_order`, `fallback_feedback`), wired from `proxy.py`. Pooled models
 declared in `sidecar/pools.json`. Non-pooled = verbatim passthrough, no logs.

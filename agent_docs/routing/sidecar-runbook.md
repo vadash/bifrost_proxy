@@ -1,6 +1,6 @@
 # Sidecar Runbook
 
-Run + verify Bifrost routing sidecar (v2.1, Bifrost-tfz).
+Run + verify Bifrost routing sidecar (v2.2, Bifrost-tfz).
 
 ## What it is
 
@@ -39,20 +39,16 @@ With raw capture (records `sidecar/capture.jsonl`):
 python -m sidecar --capture
 ```
 
-`start_sidecar.cmd` (repo-root launcher) does both: it **deletes
-`sidecar/sidecar.log` before launch** (rotation guard — no overflow across
-restarts) and invokes `python -m sidecar --reserve-bifrost 3`.
+`start_sidecar.cmd` (repo-root launcher) deletes `sidecar/sidecar.log` before
+launch (rotation guard) and runs `python -m sidecar --reserve-bifrost 3`
+(reserves first 3 alpha-sorted nvidia providers for the Bifrost auto route;
+sidecar pools the remaining 12).
 
-Or hub:
-```json
-{"op":"start","name":"sidecar",
- "application":"C:\\Users\\vadash\\AppData\\Local\\Python\\pythoncore-3.14-64\\python.exe",
- "args":["-m","sidecar","--reserve-bifrost","3"],"cwd":"C:/projects/_llm/Bifrost",
- "ready":{"log":"listening on","timeout":30}}
-```
-
+Hub start (see `agent_docs` for the exact launch spec): name `sidecar`,
+application `C:\Users\vadash\AppData\Local\Python\pythoncore-3.14-64\python.exe`,
+args `["-m","sidecar","--reserve-bifrost","3"]`, ready on log `listening on`.
 Banner: `[sidecar] listening on http://127.0.0.1:8088 -> http://127.0.0.1:8080
-pooled_models=N ...`. Edit `pools.json` requires restart (startup-only load).
+pooled_models=N ...`. `pools.json` is startup-only — edits require restart.
 
 ## Repoint client
 
@@ -96,12 +92,11 @@ regression, cold-start pin spread, `shuffle_pools` default/False behaviour
 
 ## sidecar.log record shape
 
-```json
-{"ts":"...","session":"<key[:12]>","source":"cache_key|prev_resp|hash",
- "pin":<idx>,"primary":"nvidia-7","ring":["nvidia-7","nvidia-8",...],
- "cooldowns":["nvidia-1"],"served":"nvidia-8","is_fallback":true,
- "fell_back":true,"repin":"nvidia-8|null","status":200,"desperate":false}
-```
+Emitted by `Handler._write_logs` — see `sidecar/proxy.py:154` for the
+authoritative field set (ts, session, source, pin, primary, ring, cooldowns,
+served, is_fallback, fell_back, repin, status, desperate). `session` is the
+key truncated to 12 chars; `ring` is the kept send-order list for this request;
+`fell_back` (not `is_fallback`) is the derived fallback indicator.
 
 ## Files
 
