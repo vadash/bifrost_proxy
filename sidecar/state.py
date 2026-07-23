@@ -42,14 +42,29 @@ class RoutingState:
 
     __slots__ = ("_cfg", "_lock", "_rng", "pins", "resp_map", "cooldowns", "pools")
 
-    def __init__(self, cfg: SidecarConfig):
+    def __init__(self, cfg: SidecarConfig, *, shuffle_pools: bool = True):
         self._cfg = cfg
         self._lock = threading.Lock()
         self._rng = random.Random()
         self.pins: dict[str, dict] = {}
         self.resp_map: dict[str, dict] = {}
         self.cooldowns: dict[str, float] = {}
-        self.pools: dict[str, list[str]] = cfg.pools
+        # Optionally shuffle each pool's providers once at startup so the
+        # cold-start fallback order (the body ``fallbacks`` array) is
+        # randomized across runs, not merely alpha-sorted.
+        # ``build_send_order`` still rotates the ring to start at the session
+        # pin, so the primary stays the pinned provider and the *sequence
+        # after it* is the (optionally shuffled) ring. ``shuffle_pools=False``
+        # keeps the declared order -- used by deterministic tests.
+        if shuffle_pools:
+            self.pools: dict[str, list[str]] = {
+                model: self._rng.sample(list(provs), len(provs))
+                for model, provs in cfg.pools.items()
+            }
+        else:
+            self.pools = {
+                model: list(provs) for model, provs in cfg.pools.items()
+            }
 
     # ------------------------------------------------------------------
     # Lock context -- exposes the internal lock for compound decisions.

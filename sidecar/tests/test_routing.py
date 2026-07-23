@@ -20,7 +20,7 @@ from __future__ import annotations
 import time
 import unittest
 
-from sidecar.config import SidecarConfig
+from sidecar.config import SidecarConfig, load_pools
 from sidecar.state import RoutingState, fallback_feedback
 
 # Pool used across the tests: nvidia-1 ... nvidia-10.
@@ -28,9 +28,13 @@ P = [f"nvidia-{i}" for i in range(1, 11)]
 
 
 def _state() -> RoutingState:
-    """Fresh RoutingState over a 10-provider pool with default cooldown."""
+    """Fresh RoutingState over a 10-provider pool with default cooldown.
+
+    Pool order is kept deterministic (``shuffle_pools=False``) so
+    ``build_send_order`` rotation tests can assert exact rings.
+    """
     cfg = SidecarConfig(pools={"z-ai/glm-5.2": list(P)}, default_cooldown=600.0)
-    return RoutingState(cfg)
+    return RoutingState(cfg, shuffle_pools=False)
 
 
 class TestBuildSendOrder(unittest.TestCase):
@@ -171,6 +175,70 @@ class TestColdStartRandomization(unittest.TestCase):
         with s.lock():
             pin = s.assign_pin("session-x", P, now)
         self.assertEqual(pin, 0)
+
+
+class TestShufflePools(unittest.TestCase):
+    """``RoutingState(shuffle_pools=True)`` randomizes the pool order once
+    at startup; the declared order is preserved only when ``False``."""
+
+    def test_default_shuffles_each_pool(self) -> None:
+        cfg = SidecarConfig(pools={"z-ai/glm-5.2": list(P)}, default_cooldown=600.0)
+        s = RoutingState(cfg, shuffle_pools=True)  # default behaviour
+        got = s.pools["z-ai/glm-5.2"]
+        self.assertEqual(sorted(got), sorted(P))
+        self.assertNotEqual(got, P)  # guard: with 10 providers P(shuffle==id)~1/10!
+
+    def test_false_keeps_declared_order(self) -> None:
+        cfg = SidecarConfig(pools={"z-ai/glm-5.2": list(P)}, default_cooldown=600.0)
+        s = RoutingState(cfg, shuffle_pools=False)
+        self.assertEqual(s.pools["z-ai/glm-5.2"], P)
+
+    def test_shuffle_does_not_mutate_cfg_pools(self) -> None:
+        declared = list(P)
+        cfg = SidecarConfig(pools={"z-ai/glm-5.2": declared}, default_cooldown=600.0)
+        RoutingState(cfg, shuffle_pools=True)
+        self.assertEqual(declared, P)  # cfg.pools untouched
+
+
+class TestReserveBifrost(unittest.TestCase):
+    """``load_pools(reserve_bifrost=N)`` drops the first N alpha-sorted
+    providers of each pool (matching Bifrost's own lexicographic auto-sort)."""
+
+    POOLS_PATH = None  # populated by setUpClass from a temp file
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        import json
+        import tempfile
+        import os
+        cls._tmpdir = tempfile.mkdtemp()
+        cls.POOLS_PATH = os.path.join(cls._tmpdir, "pools.json")
+        with open(cls.POOLS_PATH, "w", encoding="utf-8") as f:
+            json.dump({"z-ai/glm-5.2": list(P)}, f)
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        import shutil
+        shutil.rmtree(cls._tmpdir, ignore_errors=True)
+
+    def test_reserve_zero_keeps_all(self) -> None:
+        pools = load_pools(self.POOLS_PATH, reserve_bifrost=0)
+        self.assertEqual(pools["z-ai/glm-5.2"], P)
+
+    def test_reserve_three_drops_alpha_first_three(self) -> None:
+        # Bifrost alpha-sorts lexicographically: nvidia-1, nvidia-10, nvidia-2,
+        # ... so the first three reserved are nvidia-1, nvidia-10, nvidia-2.
+        pools = load_pools(self.POOLS_PATH, reserve_bifrost=3)
+        kept = pools["z-ai/glm-5.2"]
+        self.assertNotIn("nvidia-1", kept)
+        self.assertNotIn("nvidia-10", kept)
+        self.assertNotIn("nvidia-2", kept)
+        self.assertEqual(len(kept), len(P) - 3)
+        self.assertEqual(sorted(kept), sorted(set(P) - {"nvidia-1", "nvidia-10", "nvidia-2"}))
+
+    def test_reserve_more_than_pool_yields_empty(self) -> None:
+        pools = load_pools(self.POOLS_PATH, reserve_bifrost=len(P))
+        self.assertEqual(pools["z-ai/glm-5.2"], [])
 
 
 if __name__ == "__main__":

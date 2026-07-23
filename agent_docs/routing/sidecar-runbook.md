@@ -28,16 +28,26 @@ indistinguishable from hitting Bifrost directly.
 python -m sidecar
 ```
 
+Reserve the first 3 alpha-sorted nvidia providers for the Bifrost auto route
+(sidecar pools the remaining 12):
+```cmd
+python -m sidecar --reserve-bifrost 3
+```
+
 With raw capture (records `sidecar/capture.jsonl`):
 ```cmd
 python -m sidecar --capture
 ```
 
+`start_sidecar.cmd` (repo-root launcher) does both: it **deletes
+`sidecar/sidecar.log` before launch** (rotation guard — no overflow across
+restarts) and invokes `python -m sidecar --reserve-bifrost 3`.
+
 Or hub:
 ```json
 {"op":"start","name":"sidecar",
  "application":"C:\\Users\\vadash\\AppData\\Local\\Python\\pythoncore-3.14-64\\python.exe",
- "args":["-m","sidecar"],"cwd":"C:/projects/_llm/Bifrost",
+ "args":["-m","sidecar","--reserve-bifrost","3"],"cwd":"C:/projects/_llm/Bifrost",
  "ready":{"log":"listening on","timeout":30}}
 ```
 
@@ -80,7 +90,9 @@ python -m unittest sidecar.tests.test_routing -v
 ```
 Stdlib `unittest` only. Covers `build_send_order` (send-order + desperate),
 `fallback_feedback` (re-pin + first-skipped cooldown on 2xx fallback), cooldown
-regression, and cold-start pin spread. Run before committing routing changes.
+regression, cold-start pin spread, `shuffle_pools` default/False behaviour
+(`TestShufflePools`), and `load_pools(reserve_bifrost=N)` prefix reservation
+(`TestReserveBifrost`). Run before committing routing changes.
 
 ## sidecar.log record shape
 

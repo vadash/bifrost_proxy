@@ -60,6 +60,10 @@ class SidecarConfig:
 
     pools: dict[str, list[str]] = field(default_factory=dict)
 
+    # Number of alpha-first providers to reserve for the Bifrost auto route
+    # (excluded from sidecar pooling entirely). 0 = no reservation.
+    reserve_bifrost: int = 0
+
     @property
     def upstream_addr(self) -> tuple[str, int]:
         return (self.upstream_host, self.upstream_port)
@@ -69,21 +73,42 @@ class SidecarConfig:
         return (self.listen_host, self.listen_port)
 
 
-def load_pools(path: str) -> dict[str, list[str]]:
+def load_pools(path: str, reserve_bifrost: int = 0) -> dict[str, list[str]]:
     """Read+parse ``pools.json``.
 
     On missing file or parse error, print a ``[sidecar] WARNING: ...`` line to
     stdout and return ``{}`` (pure passthrough, no pooled models).
+
+    When ``reserve_bifrost > 0``, the first that many alpha-sorted providers
+    of each pool are dropped (reserved for the Bifrost auto route, which
+    alpha-sorts exactly the same way, so the sidecar never routes to them).
+    A notice is printed per pool when any providers are dropped.
     """
     try:
         with open(path, "r", encoding="utf-8") as f:
             data: Any = json.load(f)
         if not isinstance(data, dict):
             raise ValueError("pools.json top-level must be a JSON object")
-        return data
     except FileNotFoundError:
         print(f"[sidecar] WARNING: pools.json not found at {path} -> passthrough only")
         return {}
     except Exception as e:
         print(f"[sidecar] WARNING: pools.json parse error ({e!r}) -> passthrough only")
         return {}
+
+    if reserve_bifrost > 0:
+        reserved: set[str] = set()
+        for model, provs in data.items():
+            if not isinstance(provs, list):
+                continue
+            sorted_provs = sorted(provs)
+            keep = sorted_provs[reserve_bifrost:]
+            for p in sorted_provs[:reserve_bifrost]:
+                reserved.add(p)
+            data[model] = keep
+        if reserved:
+            print(
+                f"[sidecar] reserve_bifrost={reserve_bifrost}: reserved "
+                f"{sorted(reserved)} for the Bifrost auto route"
+            )
+    return data

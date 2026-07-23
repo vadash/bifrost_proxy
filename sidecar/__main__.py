@@ -72,6 +72,13 @@ def _build_argparser() -> argparse.ArgumentParser:
         "--upstream-timeout", type=float, default=600.0, metavar="SECS",
         help="per-upstream request timeout (default: 600)",
     )
+    p.add_argument(
+        "--reserve-bifrost", type=int, default=0, metavar="N",
+        help=(
+            "number of alpha-first providers to reserve for the Bifrost auto "
+            "route on each pool (excluded from sidecar pooling; default: 0)"
+        ),
+    )
     return p
 
 
@@ -105,7 +112,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.capture != "__DEFAULT__":
             capture_path = args.capture
 
-    pools = load_pools(args.pools)
+    pools = load_pools(args.pools, reserve_bifrost=args.reserve_bifrost)
 
     cfg = SidecarConfig(
         listen_host=listen_host,
@@ -120,6 +127,7 @@ def main(argv: list[str] | None = None) -> int:
         default_cooldown=args.cooldown,
         upstream_timeout=args.upstream_timeout,
         pools=pools,
+        reserve_bifrost=args.reserve_bifrost,
     )
 
     state = RoutingState(cfg)
@@ -134,7 +142,14 @@ def main(argv: list[str] | None = None) -> int:
     )
     if pools:
         for model, provs in pools.items():
-            print(f"[sidecar]   {model}: {len(provs)} providers")
+            print(
+                f"[sidecar]   {model}: {len(provs)} providers"
+                + (f" (+{cfg.reserve_bifrost} reserved)" if cfg.reserve_bifrost else "")
+            )
+    print(
+        f"[sidecar] fallback order: randomized per pool at startup"
+        f" (reserve_bifrost={cfg.reserve_bifrost})"
+    )
 
     server = Sidecar(cfg.listen_addr, Handler)
     server.cfg = cfg

@@ -60,3 +60,26 @@ When Bifrost falls back off the forced primary and a later provider serves,
 every session pinned to that primary would otherwise stampede onto the same
 next-in-ring provider and overload it. Cooling the first-skipped provider
 (stampede target) and re-pinning to the server spreads load back out.
+
+## Cold-start randomization: shuffled ring, reserved prefix
+
+Two startup-time decisions shape the ring before any request is routed:
+
+**Per-pool shuffle (``RoutingState.__init__(shuffle_pools=True)``).** Each
+pool's providers are shuffled once at sidecar startup
+(``self._rng.sample`` over ``cfg.pools``), so the cold-start *fallback order*
+(the body ``fallbacks`` array) is randomized across runs, not merely
+alpha-sorted. ``build_send_order`` still rotates the ring to start at the
+session pin, so the primary stays the pinned provider and the *sequence after
+it* is the shuffled ring. ``shuffle_pools=False`` keeps the declared order
+(used by deterministic tests). This is orthogonal to the least-loaded pin
+assignment's random tie-break: that decides *which* pin a cold session lands
+on; the shuffle decides the order of the *rest* of the ring.
+
+**Reserve prefix for Bifrost auto (``--reserve-bifrost N``).** When N > 0,
+``load_pools`` drops the first N alpha-sorted providers of each pool
+(matching Bifrost's own lexicographic auto-sort: `nvidia-1, nvidia-10,
+nvidia-2, …`), reserving them for the Bifrost auto route so the sidecar never
+routes to them. `start_sidecar.cmd` passes `--reserve-bifrost 3` (first 3 of
+the 15 nvidia providers), leaving 12 for sidecar pooling. CLI flag: integer
+count, default 0 (no reservation).

@@ -15,4 +15,10 @@ if not errorlevel 1 (
 
 echo Repoint your client baseUrl to http://%LISTEN%/v1  ^(Bifrost stays on :8080^)
 cd /d "%~dp0"
-python -m sidecar
+
+rem --- rotate decision log: delete on start so it cannot overflow ---
+if exist "sidecar\sidecar.log" del /q "sidecar\sidecar.log"
+
+rem --- reserve first 3 alpha-sorted providers (nvidia-1..3) for the Bifrost
+rem     auto route; sidecar pools the remaining 12 (nvidia-4..15) ---
+python -m sidecar --reserve-bifrost 3
