@@ -22,6 +22,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from .config import HOP_BY_HOP, SidecarConfig
 from .io_jsonl import JsonlWriter, parse_request_body, redact_headers
 from .meta import parse_response_meta_nonstream, parse_response_meta_stream
+from .sanitize import model_needs_sanitize, sanitize_claude_request
 from .state import RoutingState, fallback_feedback
 
 
@@ -264,11 +265,23 @@ class Handler(BaseHTTPRequestHandler):
             # 2. Build forward headers.
             fwd_headers = self._build_forward_headers()
 
-            # --- 2b. Optional pooled routing: rewrite model+fallbacks,
-            # pick pin, set state. ---
             cfg = self._cfg
             state = self._state
             forward_body = body  # default: verbatim passthrough
+
+            # 2a. Claude-family fix: strip empty thinking blocks that
+            # Bedrock/Anthropic reject with 400 ("thinking: Field
+            # required"). Applies to pooled AND passthrough requests;
+            # re-serialize only when a block was actually removed, so
+            # clean passthrough stays byte-verbatim.
+            if isinstance(request_body_parsed, dict) and model_needs_sanitize(
+                request_body_parsed.get("model")
+            ):
+                if sanitize_claude_request(request_body_parsed):
+                    forward_body = json.dumps(request_body_parsed).encode("utf-8")
+
+            # --- 2b. Optional pooled routing: rewrite model+fallbacks,
+            # pick pin, set state. ---
             if (
                 isinstance(request_body_parsed, dict)
                 and state.is_pooled(request_body_parsed.get("model"))

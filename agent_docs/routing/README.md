@@ -7,7 +7,8 @@ locality. Fixes Bifrost alpha-sort (every request starts `nvidia-1`, walks
 Status: **v2.2 (Bifrost-tfz)**. Session-pinned routing with global
 cooldown; send-order/feedback logic lives in pure helpers in `state.py`
 (`build_send_order`, `fallback_feedback`), wired from `proxy.py`. Pooled models
-declared in `sidecar/pools.json`. Non-pooled = verbatim passthrough, no logs.
+declared in `sidecar/pools.json`. Non-pooled = verbatim passthrough, no logs
+(one exception: Claude empty-thinking sanitize — see #5 below).
 
 ## Read these first
 
@@ -23,3 +24,6 @@ declared in `sidecar/pools.json`. Non-pooled = verbatim passthrough, no logs.
    pin assignment with random tie-break on cold start.
 4. **[sidecar-runbook.md](sidecar-runbook.md)** — run + verify sidecar
    (incl. `python -m unittest sidecar.tests.test_routing -v`).
+5. **[request-sanitization.md](request-sanitization.md)** — why passthrough is
+   no longer 100% verbatim: Bedrock 400s on empty `thinking` blocks, and
+   `sidecar/sanitize.py` strips them for claude/sonnet/opus models.

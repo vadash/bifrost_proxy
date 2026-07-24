@@ -5,7 +5,7 @@ providers for prompt-cache locality. Uses **bd (beads)** for issue tracking.
 
 ## Repository map
 
-- `sidecar/` — stdlib routing proxy (v2.2, Bifrost-tfz). `python -m sidecar`; listens :8088 → Bifrost :8080. Pooled models (`sidecar/pools.json`) get session-pinned routing + cooldown; non-pooled pass through verbatim. Decision log `sidecar/sidecar.log` (pooled only; deleted by `start_sidecar.cmd` on launch); `capture.jsonl` only with `--capture` (off by default).
+- `sidecar/` — stdlib routing proxy (v2.2, Bifrost-tfz). `python -m sidecar`; listens :8088 → Bifrost :8080. Pooled models (`sidecar/pools.json`) get session-pinned routing + cooldown; non-pooled pass through verbatim, except claude/sonnet/opus requests get empty `thinking` blocks stripped (`sidecar/sanitize.py`, see `agent_docs/routing/request-sanitization.md`). Decision log `sidecar/sidecar.log` (pooled only; deleted by `start_sidecar.cmd` on launch); `capture.jsonl` only with `--capture` (off by default).
 - `start_sidecar.cmd` — repo-root launcher for the sidecar.
 - `start_bifrost.cmd` — launcher for Bifrost itself (npx, port 8080).
 - `agent_docs/routing/` — **verified routing mechanics, session-identity derivation, sidecar runbook**. Read [`agent_docs/routing/README.md`](agent_docs/routing/README.md) before touching anything routing-related.
