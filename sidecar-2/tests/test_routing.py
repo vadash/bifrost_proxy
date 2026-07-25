@@ -298,16 +298,19 @@ class TestPlanPooledRequest(unittest.TestCase):
         # Full ring preserved (cold first), rotation starts at the pin.
         self.assertEqual(len(plan["keep_list"]), len(P))
         self.assertEqual(set(plan["keep_list"]), set(P))
-        # Forward body rewrites model -> "primary/pooled" and fallbacks ->
-        # rest-of-ring (each as "provider/pooled").
+        # Forward body rewrites model -> "primary/pooled"; fallbacks are
+        # capped to primary + 2 (keep_list[1:3]), NOT the full ring.
         self.assertIsInstance(plan["forward_body"], bytes)
         decoded = json.loads(plan["forward_body"])
         expected_model = f"{plan['keep_list'][0]}/z-ai/glm-5.2"
         expected_fallbacks = [
-            f"{p}/z-ai/glm-5.2" for p in plan["keep_list"][1:]
+            f"{p}/z-ai/glm-5.2" for p in plan["keep_list"][1:3]
         ]
         self.assertEqual(decoded["model"], expected_model)
         self.assertEqual(decoded["fallbacks"], expected_fallbacks)
+        # The cap itself: at most 2 fallbacks go upstream (pool has 10
+        # providers, so this genuinely differs from the old keep_list[1:]).
+        self.assertLessEqual(len(decoded["fallbacks"]), 2)
         # Identity source/keys are preserved through the rewrite.
         self.assertEqual(decoded["prompt_cache_key"], "abc123")
         self.assertNotIn("session_key", decoded)

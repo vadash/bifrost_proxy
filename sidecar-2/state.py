@@ -234,8 +234,8 @@ def plan_pooled_request(
     * ``desperate``         — True iff every provider was in cooldown
     * ``forward_body``      — re-serialized request ``bytes`` with
       ``model`` rewritten to ``"{primary}/{pooled}"`` and ``fallbacks``
-      to ``["{p}/{pooled}" for p in keep_list[1:]]``.
-
+      to ``["{p}/{pooled}" for p in keep_list[1:3]]`` (primary + 2
+      fallbacks; the full ring stays in ``keep_list`` for pins/cooldowns).
     Locking matches the inline block this replaces: purge -> derive ->
     assign_pin -> build_send_order all run under ``state.lock()`` (the same
     atomic compound decision the handler used), then the body rewrite runs
@@ -256,7 +256,9 @@ def plan_pooled_request(
         keep_list, desperate = state.build_send_order(providers, pin, now)
 
     parsed["model"] = f"{keep_list[0]}/{pooled_model}"
-    parsed["fallbacks"] = [f"{p}/{pooled_model}" for p in keep_list[1:]]
+    # Send primary + 2 fallbacks only; full ring stays in keep_list for
+    # pins/cooldowns (fallback_feedback still indexes keep_list[1]).
+    parsed["fallbacks"] = [f"{p}/{pooled_model}" for p in keep_list[1:3]]
     forward_body = json.dumps(parsed).encode("utf-8")
 
     return {

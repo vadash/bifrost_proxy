@@ -19,8 +19,24 @@ Bifrost only reaches them as a last resort. `desperate` is True iff no cold
 provider exists (the request still goes out with the full ring).
 
 Because Bifrost walks the body `fallbacks`
-verbatim (see routing-facts), **send-order == try-order**, so `keep_list[1]` is
-always the first provider tried after the primary.
+verbatim (see routing-facts), **send-order == try-order up to the cap below**,
+so `keep_list[1]` is always the first provider tried after the primary.
+
+## Upstream fallback cap: primary + 2
+
+`plan_pooled_request` (*state.py*) writes only **`keep_list[1:3]`** into the
+forwarded body's `fallbacks` — the forced primary plus two fallbacks, never
+the whole ring — even though `keep_list` retains all providers. Why: during
+NVIDIA upstream congestion the relay returns 504 after its first-byte
+timeout, and forwarding all 11 fallbacks of a 12-provider pool made one
+congested request burn ~31s x 12 before failing. The cap bounds that to at
+most 3 attempts (~93s). The full ring stays in memory so pins, cooldowns,
+and `fallback_feedback` (which reads `keep_list` directly, not the forwarded
+`fallbacks`) are unaffected: `keep_list[1]` is still the first-skipped
+stampede target, the whole-chain-failure path still cools `keep_list[0]`.
+Edge cases are pure slicing: a 1-provider pool forwards `[]`, a 2-provider
+pool forwards 1 fallback, slicing past the end is safe. The cap is a
+hard-coded slice, not a config knob.
 
 ## Post-response feedback: two paths
 
