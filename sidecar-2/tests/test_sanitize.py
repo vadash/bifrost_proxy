@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import copy
 import importlib
+import json
 import unittest
 
 # ``sidecar-2`` is not a valid ``import`` statement identifier (hyphen), so
@@ -17,6 +18,7 @@ _sanitize = importlib.import_module("sidecar-2.sanitize")
 mirror_max_tokens = _sanitize.mirror_max_tokens
 model_needs_sanitize = _sanitize.model_needs_sanitize
 rewrite_reasoning_effort = _sanitize.rewrite_reasoning_effort
+sanitize_request_body = _sanitize.sanitize_request_body
 strip_empty_thinking = _sanitize.strip_empty_thinking
 
 
@@ -254,6 +256,98 @@ class TestInjectBedrockMaxTokens(unittest.TestCase):
             with self.subTest(value=bad):
                 self.assertFalse(mirror_max_tokens(body))
                 self.assertNotIn("max_tokens", body)
+
+
+class TestSanitizeRequestBody(unittest.TestCase):
+    """``sanitize_request_body`` — orchestration of all three rewriters.
+
+    Pins the ``None``-vs-``bytes`` contract the proxy relies on: a body
+    unchanged by any rewrite stays byte-verbatim in the caller (returns
+    ``None``), and a body touched by any rewrite round-trips through
+    ``json.loads`` to the same shape, re-encoded.
+    """
+
+    def test_clean_claude_body_returns_none(self):
+        # No empty thinking, no reasoning_effort, max_tokens already set.
+        body = {
+            "model": "claude-opus-4-8",
+            "messages": [
+                _msg("user", [_text("hi")]),
+            ],
+            "max_tokens": 1024,
+        }
+        self.assertIsNone(sanitize_request_body(body))
+        # Body is untouched (no mutation when returning None).
+        self.assertEqual(body["model"], "claude-opus-4-8")
+        self.assertEqual(body["messages"], [_msg("user", [_text("hi")])])
+        self.assertEqual(body["max_tokens"], 1024)
+
+    def test_empty_thinking_block_returns_bytes(self):
+        body = {
+            "model": "claude-opus-4-8",
+            "messages": [
+                _msg("assistant", [_thinking(""), _text("answer")]),
+                _msg("user", [_text("again")]),
+            ],
+        }
+        out = sanitize_request_body(body)
+        self.assertIsNotNone(out)
+        decoded = json.loads(out)
+        # The empty thinking block was dropped, text block preserved.
+        self.assertEqual(decoded["model"], "claude-opus-4-8")
+        self.assertEqual(
+            decoded["messages"],
+            [
+                _msg("assistant", [_text("answer")]),
+                _msg("user", [_text("again")]),
+            ],
+        )
+
+    def test_reasoning_effort_rewrite_returns_bytes(self):
+        body = {
+            "model": "claude-opus-4-8",
+            "messages": [_msg("user", [_text("hi")])],
+            "reasoning_effort": "high",
+        }
+        out = sanitize_request_body(body)
+        self.assertIsNotNone(out)
+        decoded = json.loads(out)
+        self.assertNotIn("reasoning_effort", decoded)
+        self.assertEqual(decoded["thinking"], {"adaptive": True})
+        self.assertEqual(decoded["output_config"], {"effort": "high"})
+
+    def test_max_completion_tokens_mirrored_returns_bytes(self):
+        body = {
+            "model": "claude-opus-4-8",
+            "messages": [_msg("user", [_text("hi")])],
+            "max_completion_tokens": 4096,
+        }
+        out = sanitize_request_body(body)
+        self.assertIsNotNone(out)
+        decoded = json.loads(out)
+        self.assertEqual(decoded["max_tokens"], 4096)
+        self.assertEqual(decoded["max_completion_tokens"], 4096)
+
+    def test_non_claude_model_returns_none_unchanged(self):
+        # The model gate fires first regardless of body content; an OpenAI
+        # body with reasoning_effort + max_completion_tokens is forwarded
+        # verbatim (passthrough is upstream's problem, not the sidecar's).
+        body = {
+            "model": "gpt-5",
+            "messages": [_msg("user", [_text("hi")])],
+            "reasoning_effort": "high",
+            "max_completion_tokens": 8192,
+        }
+        self.assertIsNone(sanitize_request_body(body))
+        self.assertEqual(body["model"], "gpt-5")
+        self.assertEqual(body["reasoning_effort"], "high")
+        self.assertNotIn("max_tokens", body)
+
+    def test_dict_without_model_returns_none(self):
+        # A parsed dict with no ``model`` key can't match the sanitize gate;
+        # the orchestrator must short-circuit to ``None`` rather than raise.
+        self.assertIsNone(sanitize_request_body({}))
+        self.assertIsNone(sanitize_request_body({"messages": []}))
 
 
 if __name__ == "__main__":

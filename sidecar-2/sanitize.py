@@ -23,6 +23,8 @@ pooled-rewrite pattern), and only act when a rewrite is actually needed.
 
 from __future__ import annotations
 
+import json
+
 # Lowercase substrings matched against the request's model name.
 _CLAUDE_MODEL_HINTS: tuple[str, ...] = ("claude", "sonnet", "opus")
 
@@ -141,3 +143,26 @@ def mirror_max_tokens(body: dict) -> bool:
         return False
     body["max_tokens"] = mct
     return True
+
+
+def sanitize_request_body(parsed: dict) -> bytes | None:
+    """Run all body-rewrite fixes and return the re-serialized body if any applied.
+
+    Composes the three in-place rewriters (``strip_empty_thinking``,
+    ``rewrite_reasoning_effort``, ``mirror_max_tokens``) — the same sequence
+    the proxy used to inline. Runs only when the parsed model is a
+    Claude-family name (per ``model_needs_sanitize``); other models are
+    forwarded verbatim.
+
+    Returns the re-serialized ``bytes`` iff at least one rewrite touched the
+    body, else ``None`` — the ``None`` signal lets the caller leave a clean
+    passthrough byte-verbatim instead of needlessly re-serializing.
+    """
+    if not model_needs_sanitize(parsed.get("model")):
+        return None
+    changed = strip_empty_thinking(parsed) > 0
+    changed = rewrite_reasoning_effort(parsed) or changed
+    changed = mirror_max_tokens(parsed) or changed
+    if not changed:
+        return None
+    return json.dumps(parsed).encode("utf-8")

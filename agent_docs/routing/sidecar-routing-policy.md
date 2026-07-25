@@ -26,8 +26,8 @@ always the first provider tried after the primary.
 
 `fallback_feedback(keep_list, served, status) -> (repin_to, cooldown_provider)`
 (`state.py`, pure — no `self`, no lock) decides the 2xx-fallback path.
-`_apply_feedback` (`proxy.py`) runs it under the state lock and picks one of two
-mutually-exclusive paths:
+`pooled.apply_feedback` (`sidecar-2/pooled.py`) runs it under the state lock
+and picks one of two mutually-exclusive paths:
 
 **2xx served by a fallback** (`repin_to is not None`): re-pin the session to
 the server that answered (`served`); cool the **first-skipped provider**

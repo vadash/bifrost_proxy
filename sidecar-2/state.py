@@ -20,9 +20,9 @@ immutable source of truth.
 
 from __future__ import annotations
 
+import json
 import random
 import threading
-import time
 
 from .config import SidecarConfig
 from .identity import derive_session_key
@@ -209,3 +209,63 @@ def fallback_feedback(
     if len(keep_list) > 1 and served != keep_list[1]:
         cooldown_provider = keep_list[1]
     return served, cooldown_provider
+
+
+def plan_pooled_request(
+    state: RoutingState, parsed: dict, now: float
+) -> dict | None:
+    """Decide pooled routing for ``parsed`` and rewrite the body for upstream.
+
+    Module-level free function (mirrors ``fallback_feedback``): takes
+    ``state`` explicitly so it stays unit-testable from ``test_routing.py``
+    via ``importlib`` like its sibling, without depending on a handler.
+
+    Returns ``None`` iff the request's model isn't a declared pool key (the
+    "non-pooled passthrough" signal the proxy acts on with no further work).
+    Otherwise returns a dict describing the decision:
+
+    * ``pooled_model``      — the declared pool key (e.g. ``"z-ai/glm-5.2"``)
+    * ``providers``         — the pool's provider-name list
+    * ``session_key``       — derived session identity (cache_key or h:<digest>)
+    * ``session_source``   — ``"cache_key"`` or ``"hash"``
+    * ``pin``               — pinned provider index for this session
+    * ``keep_list``         — the full send-order ring (cold first, hot last),
+      rotated to start at ``pin``. ``keep_list[0]`` is the forced primary.
+    * ``desperate``         — True iff every provider was in cooldown
+    * ``forward_body``      — re-serialized request ``bytes`` with
+      ``model`` rewritten to ``"{primary}/{pooled}"`` and ``fallbacks``
+      to ``["{p}/{pooled}" for p in keep_list[1:]]``.
+
+    Locking matches the inline block this replaces: purge -> derive ->
+    assign_pin -> build_send_order all run under ``state.lock()`` (the same
+    atomic compound decision the handler used), then the body rewrite runs
+    outside the lock — it's pure dict ops + ``json.dumps`` with no shared
+    state, so holding the lock there would only serialise unrelated I/O.
+    """
+    if not isinstance(parsed, dict):
+        return None
+    pooled_model = parsed.get("model")
+    if not state.is_pooled(pooled_model):
+        return None
+
+    providers = state.pools[pooled_model]
+    with state.lock():
+        state.purge_expired(now)
+        session_key, session_source = state.derive_session_key(parsed)
+        pin = state.assign_pin(session_key, providers, now)
+        keep_list, desperate = state.build_send_order(providers, pin, now)
+
+    parsed["model"] = f"{keep_list[0]}/{pooled_model}"
+    parsed["fallbacks"] = [f"{p}/{pooled_model}" for p in keep_list[1:]]
+    forward_body = json.dumps(parsed).encode("utf-8")
+
+    return {
+        "pooled_model": pooled_model,
+        "providers": providers,
+        "session_key": session_key,
+        "session_source": session_source,
+        "pin": pin,
+        "keep_list": keep_list,
+        "desperate": desperate,
+        "forward_body": forward_body,
+    }

@@ -18,6 +18,7 @@ Uses stdlib ``unittest`` only (matches the sidecar's stdlib-only constraint).
 from __future__ import annotations
 
 import importlib
+import json
 import time
 import unittest
 
@@ -29,6 +30,7 @@ SidecarConfig = _config.SidecarConfig
 load_pools = _config.load_pools
 RoutingState = _state_mod.RoutingState
 fallback_feedback = _state_mod.fallback_feedback
+plan_pooled_request = _state_mod.plan_pooled_request
 
 # Pool used across the tests: nvidia-1 ... nvidia-10.
 P = [f"nvidia-{i}" for i in range(1, 11)]
@@ -246,6 +248,115 @@ class TestReserveBifrost(unittest.TestCase):
     def test_reserve_more_than_pool_yields_empty(self) -> None:
         pools = load_pools(self.POOLS_PATH, reserve_bifrost=len(P))
         self.assertEqual(pools["z-ai/glm-5.2"], [])
+
+
+class TestPlanPooledRequest(unittest.TestCase):
+    """``plan_pooled_request`` — pooled routing decision + body rewrite.
+
+    Holds the contract ``proxy.proxy`` relies on after the Step-2 extraction:
+    the pooled path becomes ``plan_pooled_request(state, parsed, now)`` and
+    receives a self-describing decision dict; the non-pooled path receives
+    ``None`` and forwards verbatim.
+    """
+
+    def test_non_pooled_model_returns_none(self) -> None:
+        # gpt-5 is not declared as a pool key.
+        s = _state()
+        body = {"model": "gpt-5", "messages": [{"role": "user", "content": "hi"}]}
+        self.assertIsNone(plan_pooled_request(s, body, time.time()))
+
+    def test_missing_model_returns_none(self) -> None:
+        # No model -> not pooled.
+        s = _state()
+        self.assertIsNone(plan_pooled_request(s, {"messages": []}, time.time()))
+
+    def test_non_dict_returns_none(self) -> None:
+        # The proxy guards on isinstance(...) before calling; defensively
+        # return None rather than raising.
+        s = _state()
+        self.assertIsNone(plan_pooled_request(s, None, time.time()))  # type: ignore[arg-type]
+        self.assertIsNone(plan_pooled_request(s, "raw", time.time()))  # type: ignore[arg-type]
+
+    def test_pooled_request_rewrites_model_and_fallbacks(self) -> None:
+        # Pooled model + a cache-key-tagged session. Fresh state -> all
+        # providers cold -> ring = providers rotated to the assigned pin.
+        s = _state()
+        body = {
+            "model": "z-ai/glm-5.2",
+            "prompt_cache_key": "abc123",
+            "messages": [{"role": "user", "content": "hi"}],
+        }
+        plan = plan_pooled_request(s, body, time.time())
+        self.assertIsNotNone(plan)
+        assert plan is not None  # narrow for type-checkers
+
+        self.assertEqual(plan["pooled_model"], "z-ai/glm-5.2")
+        self.assertEqual(plan["providers"], P)
+        self.assertEqual(plan["session_key"], "abc123")
+        self.assertEqual(plan["session_source"], "cache_key")
+        self.assertEqual(plan["keep_list"][0], P[plan["pin"]])
+        # Full ring preserved (cold first), rotation starts at the pin.
+        self.assertEqual(len(plan["keep_list"]), len(P))
+        self.assertEqual(set(plan["keep_list"]), set(P))
+        # Forward body rewrites model -> "primary/pooled" and fallbacks ->
+        # rest-of-ring (each as "provider/pooled").
+        self.assertIsInstance(plan["forward_body"], bytes)
+        decoded = json.loads(plan["forward_body"])
+        expected_model = f"{plan['keep_list'][0]}/z-ai/glm-5.2"
+        expected_fallbacks = [
+            f"{p}/z-ai/glm-5.2" for p in plan["keep_list"][1:]
+        ]
+        self.assertEqual(decoded["model"], expected_model)
+        self.assertEqual(decoded["fallbacks"], expected_fallbacks)
+        # Identity source/keys are preserved through the rewrite.
+        self.assertEqual(decoded["prompt_cache_key"], "abc123")
+        self.assertNotIn("session_key", decoded)
+
+    def test_deterministic_single_provider_pool(self) -> None:
+        # A 1-element pool pins to index 0 with no fallbacks to consider; the
+        # exact model/fallbacks strings are fully determined here.
+        cfg = SidecarConfig(
+            pools={"z-ai/glm-5.2": ["nvidia-1"]}, default_cooldown=600.0
+        )
+        s = RoutingState(cfg, shuffle_pools=False)
+        body = {"model": "z-ai/glm-5.2", "prompt_cache_key": "k"}
+        plan = plan_pooled_request(s, body, time.time())
+        self.assertIsNotNone(plan)
+        assert plan is not None
+        self.assertEqual(plan["keep_list"], ["nvidia-1"])
+        self.assertFalse(plan["desperate"])
+        decoded = json.loads(plan["forward_body"])
+        self.assertEqual(decoded["model"], "nvidia-1/z-ai/glm-5.2")
+        self.assertEqual(decoded["fallbacks"], [])
+
+    def test_desperate_when_all_cooldowns_hot(self) -> None:
+        s = _state()
+        now = time.time()
+        for p in P:
+            s.cooldown_trigger(p, now)
+        body = {"model": "z-ai/glm-5.2", "prompt_cache_key": "k"}
+        plan = plan_pooled_request(s, body, now)
+        self.assertIsNotNone(plan)
+        assert plan is not None
+        # Every provider was hot, so the ring is built but flagged desperate.
+        self.assertTrue(plan["desperate"])
+        self.assertEqual(set(plan["keep_list"]), set(P))
+        # Body still rewritten regardless of desparation.
+        self.assertEqual(
+            json.loads(plan["forward_body"])["model"],
+            f"{plan['keep_list'][0]}/z-ai/glm-5.2",
+        )
+
+    def test_reuses_pin_for_repeated_session(self) -> None:
+        # Same prompt_cache_key -> same session -> same pin across calls.
+        s = _state()
+        body1 = {"model": "z-ai/glm-5.2", "prompt_cache_key": "stable"}
+        body2 = {"model": "z-ai/glm-5.2", "prompt_cache_key": "stable"}
+        plan1 = plan_pooled_request(s, body1, time.time())
+        plan2 = plan_pooled_request(s, body2, time.time())
+        assert plan1 is not None and plan2 is not None
+        self.assertEqual(plan1["pin"], plan2["pin"])
+        self.assertEqual(plan1["keep_list"], plan2["keep_list"])
 
 
 if __name__ == "__main__":

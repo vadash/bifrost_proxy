@@ -5,12 +5,14 @@ locality. Fixes Bifrost alpha-sort (every request starts `nvidia-1`, walks
 `nvidia-1, nvidia-10, nvidia-2, ...` lexicographic not numeric).
 
 Status: **sidecar-2** (rebuild of v2.2). Session-pinned routing with global
-cooldown; send-order/feedback logic lives in pure helpers in `state.py`
-(`build_send_order`, `fallback_feedback`), wired from `proxy.py`. Serving
-provider extracted from response bodies by `routing_info.py::extract_provider`.
-Pooled models declared in `sidecar-2/pools.json`. Non-pooled = verbatim
-passthrough, no logs (one exception: Claude empty-thinking sanitize — see #5
-below).
+cooldown. Pure decision helpers live in `state.py`
+(`build_send_order`, `fallback_feedback`, `plan_pooled_request`); pooled
+post-response concerns (feedback application + decision-log write) live in
+`pooled.py` (`apply_feedback`, `write_logs`); both are wired from the thin
+`proxy.py` HTTP-transport layer. Serving provider extracted from response
+bodies by `routing_info.py::extract_provider`. Pooled models declared in
+`sidecar-2/pools.json`. Non-pooled = verbatim passthrough, no logs (one
+exception: Claude empty-thinking sanitize — see #5 below).
 
 ## Read these first
 

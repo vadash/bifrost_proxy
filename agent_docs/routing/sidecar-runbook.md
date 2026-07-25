@@ -85,14 +85,19 @@ Add `"stream":true` to pooled request → incremental `data:` SSE events,
 python -m unittest discover -s sidecar-2.tests -v
 ```
 Stdlib `unittest` only. Covers `build_send_order` (send-order + desperate),
-`fallback_feedback` (re-pin + first-skipped cooldown on 2xx fallback), cooldown
-regression, cold-start pin spread, `shuffle_pools`, `load_pools(reserve_bifrost=N)`,
-sanitize rewrites, and `extract_provider` against recorded SSE fixtures.
+`fallback_feedback` (re-pin + first-skipped cooldown on 2xx fallback),
+`plan_pooled_request` (pooled decision + model/fallbacks rewrite),
+`sanitize_request_body` (orchestrates the three Claude rewriters),
+cooldown regression, cold-start pin spread, `shuffle_pools`,
+`load_pools(reserve_bifrost=N)`, sanitize rewrites, and `extract_provider`
+against recorded SSE fixtures.
 
 ## sidecar.log record shape
 
-Emitted by `Handler._write_logs` in `sidecar-2/proxy.py`: ts, session, source,
-pin, primary, ring, cooldowns, served, fell_back, repin, status, desperate.
+Emitted by `pooled.write_logs` in `sidecar-2/pooled.py` (Step 3 of the
+proxy.py refactor lifted `Handler._write_logs` out to `pooled.py`): ts,
+session, source, pin, primary, ring, cooldowns, served, fell_back, repin,
+status, desperate.
 `session` is the key truncated to 12 chars; `ring` is the kept send-order list
 for this request; `fell_back` is the derived fallback indicator (`is_fallback`
 is never emitted by this Bifrost build and is not logged).

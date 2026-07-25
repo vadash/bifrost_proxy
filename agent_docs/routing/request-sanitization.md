@@ -88,9 +88,10 @@ All three fixes run at `proxy.py` step **2a**, before pooled routing (2b):
 - Gate: `model_needs_sanitize(model)` — model name contains `claude`,
   `sonnet`, or `opus` (case-insensitive). Non-Claude models and non-string
   model fields are never touched.
-- The proxy runs all three rewrites, ORs their "changed" flags, and
-  **re-serializes only when something actually changed**, so clean
-  passthrough traffic stays byte-verbatim.
+- `sanitize_request_body(parsed)` (`sanitize.py`) runs all three rewrites,
+  ORs their "changed" flags, and **re-serializes only when something actually
+  changed** (returns the new `bytes`, or `None` to leave clean passthrough
+  byte-verbatim). `proxy.py` just calls it under the gate at step 2a.
 - The gate looks at the **original** model name from the client, before
   pooled routing rewrites it to `provider/pool` form.
 
