@@ -1,7 +1,7 @@
 # Request Sanitization (Claude-family fixes)
 
-The sidecar rewrites Claude-family request bodies in two independent cases
-beyond pooled routing, both gated on a `claude`/`sonnet`/`opus` model name
+The sidecar rewrites Claude-family request bodies in three independent cases
+beyond pooled routing, all gated on a `claude`/`sonnet`/`opus` model name
 and applied to **pooled and passthrough requests alike**.
 
 ## Fix 1 — empty `thinking` blocks
@@ -57,14 +57,38 @@ an Anthropic-format request that already specifies thinking config directly
 and must be forwarded as-is. Also a no-op when `reasoning_effort` is absent
 or non-string.
 
+## Fix 3 — `max_tokens` mirroring
+
+### The failure
+
+Bifrost shows `max_completion_tokens=64000` in the request, but the response
+comes back with `output_tokens=8192`, `stop_reason=max_tokens`. The
+OpenAI-format body carries `max_completion_tokens` only (no `max_tokens`).
+Bedrock's Anthropic Messages API reads `max_tokens` (not
+`max_completion_tokens`); agentrouter doesn't translate the OpenAI field
+name, so Bedrock falls back to its 8192 default and the model dies there
+regardless of what the client asked for.
+
+### The fix
+
+`inject_bedrock_max_tokens(body)` mirrors the value under the Bedrock-native
+field name, in place:
+
+- Sets `max_tokens = max_completion_tokens` (preserving the original
+  OpenAI field too, in case an upstream still consults it).
+- **Skipped** when `max_tokens` is already set (explicit Anthropic-format
+  request) or when `max_completion_tokens` is missing/non-int.
+
+Returns `True` when the body was modified.
+
 ## Wiring — `sidecar/sanitize.py` -> `proxy.py` step 2a
 
-Both fixes run at `proxy.py` step **2a**, before pooled routing (2b):
+All three fixes run at `proxy.py` step **2a**, before pooled routing (2b):
 
 - Gate: `model_needs_sanitize(model)` — model name contains `claude`,
   `sonnet`, or `opus` (case-insensitive). Non-Claude models and non-string
   model fields are never touched.
-- The proxy runs both rewrites, ORs their "changed" flags, and
+- The proxy runs all three rewrites, ORs their "changed" flags, and
   **re-serializes only when something actually changed**, so clean
   passthrough traffic stays byte-verbatim.
 - The gate looks at the **original** model name from the client, before

@@ -23,6 +23,7 @@ from .config import HOP_BY_HOP, SidecarConfig
 from .io_jsonl import JsonlWriter, parse_request_body, redact_headers
 from .meta import parse_response_meta_nonstream, parse_response_meta_stream
 from .sanitize import (
+    inject_bedrock_max_tokens,
     model_needs_sanitize,
     rewrite_claude_reasoning_effort,
     sanitize_claude_request,
@@ -277,6 +278,8 @@ class Handler(BaseHTTPRequestHandler):
             #   - strip empty thinking blocks ("thinking: Field required" 400)
             #   - rewrite OpenAI reasoning_effort -> Bedrock thinking.adaptive
             #     + output_config.effort ("thinking.enabled is not supported" 400)
+            #   - mirror max_completion_tokens -> max_tokens so Bedrock honors
+            #     the cap instead of defaulting to 8192
             # Re-serialize only when something actually changed, so clean
             # passthrough stays byte-verbatim.
             if isinstance(request_body_parsed, dict) and model_needs_sanitize(
@@ -286,6 +289,9 @@ class Handler(BaseHTTPRequestHandler):
                 changed = (
                     rewrite_claude_reasoning_effort(request_body_parsed)
                     or changed
+                )
+                changed = (
+                    inject_bedrock_max_tokens(request_body_parsed) or changed
                 )
                 if changed:
                     forward_body = json.dumps(request_body_parsed).encode("utf-8")

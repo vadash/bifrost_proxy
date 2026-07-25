@@ -116,3 +116,28 @@ def rewrite_claude_reasoning_effort(body: dict) -> bool:
     out_cfg["effort"] = effort
     body["output_config"] = out_cfg
     return True
+
+
+def inject_bedrock_max_tokens(body: dict) -> bool:
+    """Copy ``max_completion_tokens`` -> ``max_tokens`` for Bedrock upstreams.
+
+    Bedrock's Anthropic Messages API reads ``max_tokens`` (not OpenAI's
+    ``max_completion_tokens``). When agentrouter translates an OpenAI-format
+    request, it appears not to honor ``max_completion_tokens``, so Bedrock
+    falls back to its 8192 default and the model dies with
+    ``stop_reason: max_tokens`` at exactly 8192 output tokens regardless of
+    what the client asked for. Mirroring the value under the Bedrock-native
+    field name gets the real cap through.
+
+    No-op when ``max_tokens`` is already set (explicit Anthropic-format
+    request) or when ``max_completion_tokens`` is missing/non-int.
+
+    Returns True when the body was modified (caller re-serializes).
+    """
+    if "max_tokens" in body:
+        return False
+    mct = body.get("max_completion_tokens")
+    if not isinstance(mct, int) or isinstance(mct, bool):
+        return False
+    body["max_tokens"] = mct
+    return True

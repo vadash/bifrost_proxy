@@ -11,6 +11,7 @@ import copy
 import unittest
 
 from sidecar.sanitize import (
+    inject_bedrock_max_tokens,
     model_needs_sanitize,
     rewrite_claude_reasoning_effort,
     sanitize_claude_request,
@@ -219,6 +220,38 @@ class TestRewriteReasoningEffort(unittest.TestCase):
             with self.subTest(value=bad):
                 self.assertFalse(rewrite_claude_reasoning_effort(body))
                 self.assertEqual(body["reasoning_effort"], bad)
+
+
+class TestInjectBedrockMaxTokens(unittest.TestCase):
+    """``inject_bedrock_max_tokens`` — mirror max_completion_tokens -> max_tokens."""
+
+    def test_mirrors_value(self):
+        """The 8192-cap failure: client sent 64000, Bedrock needs max_tokens."""
+        body = {"max_completion_tokens": 64000}
+        self.assertTrue(inject_bedrock_max_tokens(body))
+        self.assertEqual(body["max_tokens"], 64000)
+        # original field preserved — agentrouter may still consult it
+        self.assertEqual(body["max_completion_tokens"], 64000)
+
+    def test_skips_when_max_tokens_already_set(self):
+        """Anthropic-format request with explicit max_tokens is left alone."""
+        body = {"max_completion_tokens": 64000, "max_tokens": 4096}
+        before = copy.deepcopy(body)
+        self.assertFalse(inject_bedrock_max_tokens(body))
+        self.assertEqual(body, before)
+
+    def test_skips_when_no_max_completion_tokens(self):
+        body = {"model": "claude-opus-4-8", "messages": []}
+        before = copy.deepcopy(body)
+        self.assertFalse(inject_bedrock_max_tokens(body))
+        self.assertEqual(body, before)
+
+    def test_skips_non_int_values(self):
+        for bad in (None, "64000", 64000.0, True):
+            body = {"max_completion_tokens": bad}
+            with self.subTest(value=bad):
+                self.assertFalse(inject_bedrock_max_tokens(body))
+                self.assertNotIn("max_tokens", body)
 
 
 if __name__ == "__main__":
