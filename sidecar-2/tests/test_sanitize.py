@@ -1,4 +1,4 @@
-"""Tests for sidecar.sanitize — empty-thinking-block stripping.
+"""Tests for sidecar-2 sanitize — empty-thinking-block stripping.
 
 These guard the observable contract: Bedrock's ``thinking: Field required``
 400 must no longer trigger for Claude-family requests carrying degenerate
@@ -8,14 +8,16 @@ thinking blocks, and no other payload shape may be mutated.
 from __future__ import annotations
 
 import copy
+import importlib
 import unittest
 
-from sidecar.sanitize import (
-    inject_bedrock_max_tokens,
-    model_needs_sanitize,
-    rewrite_claude_reasoning_effort,
-    sanitize_claude_request,
-)
+# ``sidecar-2`` is not a valid ``import`` statement identifier (hyphen), so
+# load the module via importlib.
+_sanitize = importlib.import_module("sidecar-2.sanitize")
+mirror_max_tokens = _sanitize.mirror_max_tokens
+model_needs_sanitize = _sanitize.model_needs_sanitize
+rewrite_reasoning_effort = _sanitize.rewrite_reasoning_effort
+strip_empty_thinking = _sanitize.strip_empty_thinking
 
 
 def _msg(role, content):
@@ -57,7 +59,7 @@ class TestModelNeedsSanitize(unittest.TestCase):
 
 
 class TestSanitizeClaudeRequest(unittest.TestCase):
-    """``sanitize_claude_request`` — strip empty thinking, keep everything else."""
+    """``strip_empty_thinking`` — strip empty thinking, keep everything else."""
 
     def test_strips_empty_thinking_keeps_signature(self):
         """The exact failure from the 400 log: ``thinking: ""`` + signature."""
@@ -75,7 +77,7 @@ class TestSanitizeClaudeRequest(unittest.TestCase):
                 ),
             ],
         }
-        removed = sanitize_claude_request(body)
+        removed = strip_empty_thinking(body)
         self.assertEqual(removed, 1)
         blocks = body["messages"][1]["content"]
         self.assertEqual([b["type"] for b in blocks], ["text", "tool_use"])
@@ -91,7 +93,7 @@ class TestSanitizeClaudeRequest(unittest.TestCase):
                 ]),
             ],
         }
-        removed = sanitize_claude_request(body)
+        removed = strip_empty_thinking(body)
         self.assertEqual(removed, 3)
         self.assertEqual(body["messages"][0]["content"], [_text("kept")])
 
@@ -104,7 +106,7 @@ class TestSanitizeClaudeRequest(unittest.TestCase):
                 ]),
             ],
         }
-        removed = sanitize_claude_request(body)
+        removed = strip_empty_thinking(body)
         self.assertEqual(removed, 0)
         self.assertEqual(len(body["messages"][0]["content"]), 2)
 
@@ -117,7 +119,7 @@ class TestSanitizeClaudeRequest(unittest.TestCase):
                 _msg("user", [_text("again")]),
             ],
         }
-        removed = sanitize_claude_request(body)
+        removed = strip_empty_thinking(body)
         self.assertEqual(removed, 1)
         self.assertEqual([m["role"] for m in body["messages"]], ["user", "user"])
 
@@ -135,23 +137,23 @@ class TestSanitizeClaudeRequest(unittest.TestCase):
             "thinking": {"type": "enabled", "budget_tokens": 10000},
         }
         before = copy.deepcopy(body)
-        removed = sanitize_claude_request(body)
+        removed = strip_empty_thinking(body)
         self.assertEqual(removed, 0)
         self.assertEqual(body, before)  # zero mutation on clean payloads
 
     def test_user_messages_never_touched(self):
         body = {"messages": [_msg("user", [_thinking("")])]}
-        removed = sanitize_claude_request(body)
+        removed = strip_empty_thinking(body)
         self.assertEqual(removed, 0)
         self.assertEqual(body["messages"][0]["content"], [_thinking("")])
 
     def test_non_list_inputs_noop(self):
-        self.assertEqual(sanitize_claude_request({}), 0)
-        self.assertEqual(sanitize_claude_request({"messages": None}), 0)
-        self.assertEqual(sanitize_claude_request({"messages": "nope"}), 0)
+        self.assertEqual(strip_empty_thinking({}), 0)
+        self.assertEqual(strip_empty_thinking({"messages": None}), 0)
+        self.assertEqual(strip_empty_thinking({"messages": "nope"}), 0)
         # string-content assistant messages are legal and pass through
         body = {"messages": [_msg("assistant", "plain string content")]}
-        self.assertEqual(sanitize_claude_request(body), 0)
+        self.assertEqual(strip_empty_thinking(body), 0)
         self.assertEqual(body["messages"][0]["content"], "plain string content")
 
     def test_interleaved_role_alternation_preserved(self):
@@ -166,7 +168,7 @@ class TestSanitizeClaudeRequest(unittest.TestCase):
                 _msg("assistant", [_thinking(""), _text("b")]),
             ],
         }
-        removed = sanitize_claude_request(body)
+        removed = strip_empty_thinking(body)
         self.assertEqual(removed, 3)
         roles = [m["role"] for m in body["messages"]]
         self.assertEqual(roles, ["user", "assistant", "user", "user", "assistant"])
@@ -176,7 +178,7 @@ class TestSanitizeClaudeRequest(unittest.TestCase):
 
 
 class TestRewriteReasoningEffort(unittest.TestCase):
-    """``rewrite_claude_reasoning_effort`` — OpenAI -> Bedrock-native shape."""
+    """``rewrite_reasoning_effort`` — OpenAI -> Bedrock-native shape."""
 
     def test_rewrites_medium_to_adaptive_plus_effort(self):
         """The exact failure from the 400 log: reasoning_effort=medium, no thinking."""
@@ -186,7 +188,7 @@ class TestRewriteReasoningEffort(unittest.TestCase):
             "reasoning_effort": "medium",
             "max_completion_tokens": 64000,
         }
-        self.assertTrue(rewrite_claude_reasoning_effort(body))
+        self.assertTrue(rewrite_reasoning_effort(body))
         self.assertNotIn("reasoning_effort", body)
         self.assertEqual(body["thinking"], {"adaptive": True})
         self.assertEqual(body["output_config"], {"effort": "medium"})
@@ -195,7 +197,7 @@ class TestRewriteReasoningEffort(unittest.TestCase):
 
     def test_preserves_existing_output_config_keys(self):
         body = {"reasoning_effort": "high", "output_config": {"foo": "bar"}}
-        self.assertTrue(rewrite_claude_reasoning_effort(body))
+        self.assertTrue(rewrite_reasoning_effort(body))
         self.assertEqual(body["output_config"], {"foo": "bar", "effort": "high"})
 
     def test_skips_when_explicit_thinking_present(self):
@@ -205,30 +207,30 @@ class TestRewriteReasoningEffort(unittest.TestCase):
             "thinking": {"type": "enabled", "budget_tokens": 10000},
         }
         before = copy.deepcopy(body)
-        self.assertFalse(rewrite_claude_reasoning_effort(body))
+        self.assertFalse(rewrite_reasoning_effort(body))
         self.assertEqual(body, before)
 
     def test_skips_when_no_reasoning_effort(self):
         body = {"model": "claude-opus-4-8", "messages": []}
         before = copy.deepcopy(body)
-        self.assertFalse(rewrite_claude_reasoning_effort(body))
+        self.assertFalse(rewrite_reasoning_effort(body))
         self.assertEqual(body, before)
 
     def test_skips_non_string_effort(self):
         for bad in (None, 5, True, ["medium"]):
             body = {"reasoning_effort": bad}
             with self.subTest(value=bad):
-                self.assertFalse(rewrite_claude_reasoning_effort(body))
+                self.assertFalse(rewrite_reasoning_effort(body))
                 self.assertEqual(body["reasoning_effort"], bad)
 
 
 class TestInjectBedrockMaxTokens(unittest.TestCase):
-    """``inject_bedrock_max_tokens`` — mirror max_completion_tokens -> max_tokens."""
+    """``mirror_max_tokens`` — mirror max_completion_tokens -> max_tokens."""
 
     def test_mirrors_value(self):
         """The 8192-cap failure: client sent 64000, Bedrock needs max_tokens."""
         body = {"max_completion_tokens": 64000}
-        self.assertTrue(inject_bedrock_max_tokens(body))
+        self.assertTrue(mirror_max_tokens(body))
         self.assertEqual(body["max_tokens"], 64000)
         # original field preserved — agentrouter may still consult it
         self.assertEqual(body["max_completion_tokens"], 64000)
@@ -237,20 +239,20 @@ class TestInjectBedrockMaxTokens(unittest.TestCase):
         """Anthropic-format request with explicit max_tokens is left alone."""
         body = {"max_completion_tokens": 64000, "max_tokens": 4096}
         before = copy.deepcopy(body)
-        self.assertFalse(inject_bedrock_max_tokens(body))
+        self.assertFalse(mirror_max_tokens(body))
         self.assertEqual(body, before)
 
     def test_skips_when_no_max_completion_tokens(self):
         body = {"model": "claude-opus-4-8", "messages": []}
         before = copy.deepcopy(body)
-        self.assertFalse(inject_bedrock_max_tokens(body))
+        self.assertFalse(mirror_max_tokens(body))
         self.assertEqual(body, before)
 
     def test_skips_non_int_values(self):
         for bad in (None, "64000", 64000.0, True):
             body = {"max_completion_tokens": bad}
             with self.subTest(value=bad):
-                self.assertFalse(inject_bedrock_max_tokens(body))
+                self.assertFalse(mirror_max_tokens(body))
                 self.assertNotIn("max_tokens", body)
 
 

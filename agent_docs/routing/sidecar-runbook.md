@@ -4,12 +4,12 @@ Run + verify Bifrost routing sidecar (v2.2, Bifrost-tfz).
 
 ## What it is
 
-Stdlib (`ThreadingHTTPServer` + `http.client`) proxy package at `sidecar/`
-(run with `python -m sidecar`). Listens `127.0.0.1:8088` → Bifrost `127.0.0.1:8080`.
+Stdlib (`ThreadingHTTPServer` + `http.client`) proxy package at `sidecar-2/`
+(run with `python -m sidecar-2`). Listens `127.0.0.1:8088` → Bifrost `127.0.0.1:8080`.
 
-Pooled models (`sidecar/pools.json` keys): rewrite `model` → `provider/model`,
+Pooled models (`sidecar-2/pools.json` keys): rewrite `model` → `provider/model`,
 own `fallbacks` array, pin session to least-loaded provider, cool down failures
-globally, log to `sidecar/sidecar.log`. `sidecar/capture.jsonl` is recorded
+globally, log to `sidecar-2/sidecar.log`. `sidecar-2/capture.jsonl` is recorded
 only when `--capture` is passed (off by default).
 
 Non-pooled models: verbatim passthrough, no state, no headers, no logs —
@@ -25,28 +25,28 @@ indistinguishable from hitting Bifrost directly.
 ## Start
 
 ```cmd
-python -m sidecar
+python -m sidecar-2
 ```
 
 Reserve the first 3 alpha-sorted nvidia providers for the Bifrost auto route
 (sidecar pools the remaining 12):
 ```cmd
-python -m sidecar --reserve-bifrost 3
+python -m sidecar-2 --reserve-bifrost 3
 ```
 
-With raw capture (records `sidecar/capture.jsonl`):
+With raw capture (records `sidecar-2/capture.jsonl`):
 ```cmd
-python -m sidecar --capture
+python -m sidecar-2 --capture
 ```
 
-`start_sidecar.cmd` (repo-root launcher) deletes `sidecar/sidecar.log` before
-launch (rotation guard) and runs `python -m sidecar --reserve-bifrost 3`
+`start_sidecar.cmd` (repo-root launcher) deletes `sidecar-2/sidecar.log` before
+launch (rotation guard) and runs `python -m sidecar-2 --reserve-bifrost 3`
 (reserves first 3 alpha-sorted nvidia providers for the Bifrost auto route;
 sidecar pools the remaining 12).
 
-Hub start (see `agent_docs` for the exact launch spec): name `sidecar`,
+Hub start: name `sidecar`,
 application `C:\Users\vadash\AppData\Local\Python\pythoncore-3.14-64\python.exe`,
-args `["-m","sidecar","--reserve-bifrost","3"]`, ready on log `listening on`.
+args `["-m","sidecar-2","--reserve-bifrost","3"]`, ready on log `listening on`.
 Banner: `[sidecar] listening on http://127.0.0.1:8088 -> http://127.0.0.1:8080
 pooled_models=N ...`. `pools.json` is startup-only — edits require restart.
 
@@ -82,29 +82,28 @@ Add `"stream":true` to pooled request → incremental `data:` SSE events,
 
 ### Unit tests (no live Bifrost needed)
 ```cmd
-python -m unittest sidecar.tests.test_routing -v
+python -m unittest discover -s sidecar-2.tests -v
 ```
 Stdlib `unittest` only. Covers `build_send_order` (send-order + desperate),
 `fallback_feedback` (re-pin + first-skipped cooldown on 2xx fallback), cooldown
-regression, cold-start pin spread, `shuffle_pools` default/False behaviour
-(`TestShufflePools`), and `load_pools(reserve_bifrost=N)` prefix reservation
-(`TestReserveBifrost`). Run before committing routing changes.
+regression, cold-start pin spread, `shuffle_pools`, `load_pools(reserve_bifrost=N)`,
+sanitize rewrites, and `extract_provider` against recorded SSE fixtures.
 
 ## sidecar.log record shape
 
-Emitted by `Handler._write_logs` — see `sidecar/proxy.py:154` for the
-authoritative field set (ts, session, source, pin, primary, ring, cooldowns,
-served, is_fallback, fell_back, repin, status, desperate). `session` is the
-key truncated to 12 chars; `ring` is the kept send-order list for this request;
-`fell_back` (not `is_fallback`) is the derived fallback indicator.
+Emitted by `Handler._write_logs` in `sidecar-2/proxy.py`: ts, session, source,
+pin, primary, ring, cooldowns, served, fell_back, repin, status, desperate.
+`session` is the key truncated to 12 chars; `ring` is the kept send-order list
+for this request; `fell_back` is the derived fallback indicator (`is_fallback`
+is never emitted by this Bifrost build and is not logged).
 
 ## Files
 
 | File | Purpose |
 |---|---|
-| `sidecar/` | Proxy package (stdlib; `__main__.py` entrypoint) |
-| `sidecar/pools.json` | Pooled models → ordered provider list |
-| `start_sidecar.cmd` | Repo-root launcher (`python -m sidecar`) |
-| `sidecar/sidecar.log` | Decision log (pooled only, gitignored) |
-| `sidecar/capture.jsonl` | Raw capture (pooled only, gitignored; **off by default — add `--capture`**) |
-| `sidecar/tests/test_routing.py` | Stdlib `unittest` for `build_send_order`/`fallback_feedback`/cooldowns/cold-start (see Verify) |
+| `sidecar-2/` | Proxy package (stdlib; `__main__.py` entrypoint) |
+| `sidecar-2/pools.json` | Pooled models → ordered provider list |
+| `start_sidecar.cmd` | Repo-root launcher (`python -m sidecar-2`) |
+| `sidecar-2/sidecar.log` | Decision log (pooled only, gitignored) |
+| `sidecar-2/capture.jsonl` | Raw capture (pooled only, gitignored; **off by default — add `--capture`**) |
+| `sidecar-2/tests/test_routing.py` | Stdlib `unittest` for `build_send_order`/`fallback_feedback`/cooldowns/cold-start (see Verify) |

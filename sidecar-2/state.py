@@ -1,6 +1,6 @@
 """In-memory routing state, fully encapsulated behind a thread-safe class.
 
-Replaces the six module-level globals (``PINS``, ``RESP_MAP``, ``COOLDOWNS``,
+Replaces the module-level globals (``PINS``, ``COOLDOWNS``,
 ``POOLS``) and the single shared ``STATE_LOCK`` from the old monolithic
 proxy.py. Everything that mutates routing state goes through one object; the
 HTTP handler receives it (dependency injection) so there is no hidden global
@@ -12,8 +12,6 @@ touch at least two of them together, so one lock beats three):
 * ``pins``      : session_key -> {"pin": int, "seen": float}
                   pin = index into the pooled model's provider list;
                   seen = last activity epoch, refreshed every request.
-* ``resp_map``  : response_id -> {"session": str, "seen": float}
-                  enables the ``previous_response_id`` branch of the cascade.
 * ``cooldowns``  : provider_name -> expiry_epoch  (hot iff expiry > now).
 
 The config is held by reference so TTL / cooldown duration come from one
@@ -40,14 +38,13 @@ class RoutingState:
     old ``STATE_LOCK`` gave, now explicit and local to this object.
     """
 
-    __slots__ = ("_cfg", "_lock", "_rng", "pins", "resp_map", "cooldowns", "pools")
+    __slots__ = ("_cfg", "_lock", "_rng", "pins", "cooldowns", "pools")
 
     def __init__(self, cfg: SidecarConfig, *, shuffle_pools: bool = True):
         self._cfg = cfg
         self._lock = threading.Lock()
         self._rng = random.Random()
         self.pins: dict[str, dict] = {}
-        self.resp_map: dict[str, dict] = {}
         self.cooldowns: dict[str, float] = {}
         # Optionally shuffle each pool's providers once at startup so the
         # cold-start fallback order (the body ``fallbacks`` array) is
@@ -81,7 +78,7 @@ class RoutingState:
         return self._lock
 
     def purge_expired(self, now: float) -> None:
-        """Purge expired pins/resp_map (inactivity > session_ttl) and expired
+        """Purge expired pins (inactivity > session_ttl) and expired
         cooldowns (``now >= expiry``). Must be called under ``self.lock()``.
         """
         ttl = self._cfg.session_ttl
@@ -90,11 +87,6 @@ class RoutingState:
         ]
         for k in expired_sessions:
             del self.pins[k]
-        expired_resps = [
-            k for k, v in self.resp_map.items() if now - v["seen"] > ttl
-        ]
-        for k in expired_resps:
-            del self.resp_map[k]
         expired_cd = [p for p, exp in self.cooldowns.items() if now >= exp]
         for p in expired_cd:
             del self.cooldowns[p]
@@ -119,11 +111,8 @@ class RoutingState:
         )
 
     def derive_session_key(self, body: dict) -> tuple[str, str]:
-        """Return ``(session_key, source)`` via the identity cascade.
-
-        Must be called under ``self.lock()`` (it reads ``resp_map``).
-        """
-        return derive_session_key(body, self.resp_map)
+        """Return ``(session_key, source)`` via the identity cascade."""
+        return derive_session_key(body)
 
     def assign_pin(
         self, session_key: str, providers: list[str], now: float
@@ -188,14 +177,6 @@ class RoutingState:
         cold = [p for p in ring if not self.cooldown_is_hot(p, now)]
         hot = [p for p in ring if self.cooldown_is_hot(p, now)]
         return cold + hot, not cold
-
-    def map_response(self, response_id: str, session_key: str, now: float) -> None:
-        """Record ``response_id -> session`` for future prev-id lookups.
-
-        Must be called under ``self.lock()``.
-        """
-        self.resp_map[response_id] = {"session": session_key, "seen": now}
-
 
     def is_pooled(self, model: str | None) -> bool:
         """True iff ``model`` is declared as a pool key in pools.json."""

@@ -5,7 +5,7 @@
 .beads-credential-key
 .beads/proxieddb/
 # Sidecar capture output (runtime data, not source)
-sidecar/capture.jsonl
-sidecar/sidecar.log
+sidecar-2/capture.jsonl
+sidecar-2/sidecar.log
 # Python bytecode (runtime, not source)
 __pycache__/

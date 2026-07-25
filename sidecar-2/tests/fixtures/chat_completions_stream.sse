@@ -1,0 +1,8 @@
+data: {"id":"chatcmpl-3f33bd22-ed2a-4c9f-93da-275ff8b4cd5c","choices":[{"index":0,"delta":{"role":"assistant","content":"Hi"}}],"created":1785012252,"model":"z-ai/glm-5.2","object":"chat.completion.chunk","system_fingerprint":"","usage":null,"extra_fields":{"request_type":"chat_completion_stream","routing_info":{"provider":"nvidia-1","model":"z-ai/glm-5.2","key":"NVIDIA_API_KEY_1"},"provider":"nvidia-1","original_model_requested":"z-ai/glm-5.2","resolved_model_used":"z-ai/glm-5.2","latency":1426,"chunk_index":0}}
+
+data: {"id":"chatcmpl-3f33bd22-ed2a-4c9f-93da-275ff8b4cd5c","choices":[{"index":0,"finish_reason":"stop","delta":{"role":"assistant","content":"!"}}],"created":1785012252,"model":"z-ai/glm-5.2","object":"chat.completion.chunk","system_fingerprint":"","usage":null,"extra_fields":{"request_type":"chat_completion_stream","routing_info":{"provider":"nvidia-1","model":"z-ai/glm-5.2","key":"NVIDIA_API_KEY_1"},"provider":"nvidia-1","original_model_requested":"z-ai/glm-5.2","resolved_model_used":"z-ai/glm-5.2","latency":674,"chunk_index":1}}
+
+data: {"id":"chatcmpl-3f33bd22-ed2a-4c9f-93da-275ff8b4cd5c","choices":[{"index":0,"delta":{}}],"created":1785012252,"model":"z-ai/glm-5.2","object":"chat.completion.chunk","system_fingerprint":"","usage":{"prompt_tokens":11,"completion_tokens":3,"total_tokens":14},"extra_fields":{"request_type":"chat_completion_stream","routing_info":{"provider":"nvidia-1","model":"z-ai/glm-5.2","key":"NVIDIA_API_KEY_1"},"provider":"nvidia-1","original_model_requested":"z-ai/glm-5.2","resolved_model_used":"z-ai/glm-5.2","latency":2101,"chunk_index":2}}
+
+data: [DONE]
+

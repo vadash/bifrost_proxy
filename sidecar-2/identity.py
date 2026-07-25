@@ -4,9 +4,6 @@ The cascade resolves which "session" a request belongs to so the router can
 pin it to one provider for prompt-cache locality. See
 ``agent_docs/routing/session-identity.md`` for the verified rationale.
 
-The only non-local dependency is the ``resp_map`` argument to
-``derive_session_key`` -- callers pass the active routing-state map, so this
-module never imports ``state`` (keeps it pure and testable in isolation).
 """
 
 from __future__ import annotations
@@ -57,22 +54,15 @@ def first_user_text(body: dict) -> str:
     return ""
 
 
-def derive_session_key(
-    body: dict, resp_map: dict[str, dict]
-) -> tuple[str, str]:
+def derive_session_key(body: dict) -> tuple[str, str]:
     """Return ``(session_key, source)`` via the cascade (first match wins):
 
-    1. ``prompt_cache_key`` truthy      -> (str(that), "cache_key")
-    2. ``previous_response_id`` in map  -> (stored session, "prev_resp")
-    3. hash fallback -> ("h:" + sha256(instructions + "\\n" + first_user_text)[:32], "hash")
+    1. ``prompt_cache_key`` truthy -> (str(that), "cache_key")
+    2. hash fallback -> ("h:" + sha256(instructions + "\\n" + first_user_text)[:32], "hash")
     """
     cache_key = body.get("prompt_cache_key")
     if cache_key:
         return (str(cache_key), "cache_key")
-
-    prev_id = body.get("previous_response_id")
-    if prev_id is not None and prev_id in resp_map:
-        return (resp_map[prev_id]["session"], "prev_resp")
 
     instructions = body.get("instructions") or ""
     text = first_user_text(body)

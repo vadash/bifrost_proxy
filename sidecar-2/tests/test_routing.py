@@ -17,11 +17,18 @@ Uses stdlib ``unittest`` only (matches the sidecar's stdlib-only constraint).
 
 from __future__ import annotations
 
+import importlib
 import time
 import unittest
 
-from sidecar.config import SidecarConfig, load_pools
-from sidecar.state import RoutingState, fallback_feedback
+# ``sidecar-2`` is not a valid ``import`` statement identifier (hyphen), so
+# load the modules via importlib.
+_config = importlib.import_module("sidecar-2.config")
+_state_mod = importlib.import_module("sidecar-2.state")
+SidecarConfig = _config.SidecarConfig
+load_pools = _config.load_pools
+RoutingState = _state_mod.RoutingState
+fallback_feedback = _state_mod.fallback_feedback
 
 # Pool used across the tests: nvidia-1 ... nvidia-10.
 P = [f"nvidia-{i}" for i in range(1, 11)]

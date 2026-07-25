@@ -1,4 +1,4 @@
-"""Entrypoint: ``python -m sidecar``.
+"""Entrypoint: ``python -m sidecar-2``.
 
 Parses CLI args, builds the immutable ``SidecarConfig``, loads pools, wires
 ``RoutingState`` + ``JsonlWriter``s onto the ``Sidecar`` server, and serves.

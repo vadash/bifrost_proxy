@@ -21,12 +21,12 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from .config import HOP_BY_HOP, SidecarConfig
 from .io_jsonl import JsonlWriter, parse_request_body, redact_headers
-from .meta import parse_response_meta_nonstream, parse_response_meta_stream
+from .routing_info import extract_provider
 from .sanitize import (
-    inject_bedrock_max_tokens,
+    mirror_max_tokens,
     model_needs_sanitize,
-    rewrite_claude_reasoning_effort,
-    sanitize_claude_request,
+    rewrite_reasoning_effort,
+    strip_empty_thinking,
 )
 from .state import RoutingState, fallback_feedback
 
@@ -42,7 +42,7 @@ class Sidecar(ThreadingHTTPServer):
 
     # populated by main() before serve_forever()
     cfg: SidecarConfig        # immutable tunables + paths
-    state: RoutingState       # thread-safe routing state (pins/map/cooldowns)
+    state: RoutingState       # thread-safe routing state (pins/cooldowns)
     capture_writer: JsonlWriter  # capture.jsonl appender (offline unless --capture)
     log_writer: JsonlWriter   # sidecar.log appender (always on, pooled only)
 
@@ -117,18 +117,17 @@ class Handler(BaseHTTPRequestHandler):
     # --- Post-response feedback (pooled only) ---------------------------------
     def _apply_feedback(
         self, *, pooled_model, session_key, providers, keep_list,
-        routing_info, response_id, response_status, error_str,
+        served_provider, response_status, error_str,
     ) -> None:
-        """Adjust pin + cooldowns after Bifrost replies, and map resp-id.
+        """Adjust pin + cooldowns after Bifrost replies.
 
-        Mirrors the legacy "6b. Post-response feedback" block exactly, now
-        expressed against the injected ``RoutingState``.
+        ``served_provider`` is the provider name extracted from the response
+        body (or None when the terminal event never arrived -- a normal
+        outcome, in which case the fallback path is skipped).
         """
         state = self._state
         now_fb = time.time()
-        served = None
-        if isinstance(routing_info, dict) and routing_info:
-            served = routing_info.get("provider")
+        served = served_provider
 
         repin_to, cool_provider = fallback_feedback(
             keep_list, served, response_status
@@ -153,14 +152,11 @@ class Handler(BaseHTTPRequestHandler):
                 if len(keep_list) > 1:
                     state.re_pin(session_key, keep_list[1], providers, now_fb)
 
-            if response_id is not None:
-                state.map_response(response_id, session_key, now_fb)
-
     # --- Logging (pooled only) ------------------------------------------------
     def _write_logs(
         self, *, pooled_model, session_key, session_source, pin, keep_list,
-        routing_info, response_status, is_stream, request_body_parsed,
-        has_previous_response_id, desperate, error_str,
+        served_provider, response_status, is_stream, request_body_parsed,
+        desperate, error_str,
     ) -> None:
         """Emit capture.jsonl (if enabled) + sidecar.log for pooled requests.
 
@@ -178,25 +174,16 @@ class Handler(BaseHTTPRequestHandler):
                 "path": self.path,
                 "request_headers": redact_headers(self.headers.items()),
                 "request_body": request_body_parsed,
-                "has_previous_response_id": (
-                    has_previous_response_id
-                    if isinstance(request_body_parsed, dict)
-                    else False
-                ),
                 "response_status": response_status,
                 "streaming": is_stream,
-                "routing_info": routing_info,
+                "served_provider": served_provider,
             }
             if error_str is not None:
                 record["error"] = error_str
             self._capture.safe(record)
 
         # --- sidecar.log decision line (always for pooled) ---
-        served = None
-        is_fallback_val = None
-        if isinstance(routing_info, dict) and routing_info:
-            served = routing_info.get("provider")
-            is_fallback_val = routing_info.get("is_fallback")
+        served = served_provider
         fell_back = (
             served is not None
             and bool(keep_list)
@@ -225,7 +212,6 @@ class Handler(BaseHTTPRequestHandler):
             "ring": keep_list if keep_list else None,
             "cooldowns": hot,
             "served": served,
-            "is_fallback": is_fallback_val,
             "fell_back": fell_back,
             "repin": repin,
             "status": response_status,
@@ -238,10 +224,8 @@ class Handler(BaseHTTPRequestHandler):
         response_line_sent = False
         response_status = None
         is_stream = None
-        routing_info = None
-        response_id = None
+        served_provider = None
         request_body_parsed = None
-        has_previous_response_id = False
         error_str = None
 
         # --- Pooled-routing bookkeeping (only meaningful when pooled_model set) ---
@@ -261,11 +245,6 @@ class Handler(BaseHTTPRequestHandler):
 
             # Parse request body early so it's available in error paths.
             request_body_parsed = parse_request_body(body)
-            if isinstance(request_body_parsed, dict):
-                prv = request_body_parsed.get("previous_response_id")
-                has_previous_response_id = prv is not None
-            else:
-                has_previous_response_id = False
 
             # 2. Build forward headers.
             fwd_headers = self._build_forward_headers()
@@ -285,13 +264,13 @@ class Handler(BaseHTTPRequestHandler):
             if isinstance(request_body_parsed, dict) and model_needs_sanitize(
                 request_body_parsed.get("model")
             ):
-                changed = sanitize_claude_request(request_body_parsed) > 0
+                changed = strip_empty_thinking(request_body_parsed) > 0
                 changed = (
-                    rewrite_claude_reasoning_effort(request_body_parsed)
+                    rewrite_reasoning_effort(request_body_parsed)
                     or changed
                 )
                 changed = (
-                    inject_bedrock_max_tokens(request_body_parsed) or changed
+                    mirror_max_tokens(request_body_parsed) or changed
                 )
                 if changed:
                     forward_body = json.dumps(request_body_parsed).encode("utf-8")
@@ -368,10 +347,10 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_header("Connection", "close")
                 self.end_headers()
                 self.wfile.write(resp_body)
-                routing_info, response_id = parse_response_meta_nonstream(resp_body)
+                served_provider = extract_provider(resp_body, is_stream=False)
 
             if is_stream:
-                routing_info, response_id = parse_response_meta_stream(bytes(sse_buf))
+                served_provider = extract_provider(bytes(sse_buf), is_stream=True)
 
             # --- 6b. Post-response feedback (pooled requests only). ---
             if pooled_model is not None:
@@ -380,8 +359,7 @@ class Handler(BaseHTTPRequestHandler):
                     session_key=session_key,
                     providers=providers,
                     keep_list=keep_list,
-                    routing_info=routing_info,
-                    response_id=response_id,
+                    served_provider=served_provider,
                     response_status=response_status,
                     error_str=error_str,
                 )
@@ -413,11 +391,10 @@ class Handler(BaseHTTPRequestHandler):
                     session_source=session_source,
                     pin=pin,
                     keep_list=keep_list,
-                    routing_info=routing_info,
+                    served_provider=served_provider,
                     response_status=response_status,
                     is_stream=is_stream,
                     request_body_parsed=request_body_parsed,
-                    has_previous_response_id=has_previous_response_id,
                     desperate=desperate,
                     error_str=error_str,
                 )

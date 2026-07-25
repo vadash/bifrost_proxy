@@ -22,7 +22,7 @@ replays the poisoned history and 400s again; the session is stuck.
 
 ### The fix
 
-`sanitize_claude_request(body)` strips, in place, any
+`strip_empty_thinking(body)` strips, in place, any
 `{"type": "thinking", ...}` block whose `thinking` is missing, null, or
 whitespace-only. Blocks with real thinking text pass through. An assistant
 message left with `content: []` after stripping is dropped entirely (empty
@@ -43,7 +43,7 @@ Use "***.***.adaptive" and "output_config.effort" to control thinking behavior.
 
 ### The fix
 
-`rewrite_claude_reasoning_effort(body)` converts the OpenAI field to
+`rewrite_reasoning_effort(body)` converts the OpenAI field to
 Bedrock's native shape **in place**, and returns `True` when it changed
 anything:
 
@@ -71,7 +71,7 @@ regardless of what the client asked for.
 
 ### The fix
 
-`inject_bedrock_max_tokens(body)` mirrors the value under the Bedrock-native
+`mirror_max_tokens(body)` mirrors the value under the Bedrock-native
 field name, in place:
 
 - Sets `max_tokens = max_completion_tokens` (preserving the original
@@ -81,7 +81,7 @@ field name, in place:
 
 Returns `True` when the body was modified.
 
-## Wiring — `sidecar/sanitize.py` -> `proxy.py` step 2a
+## Wiring — `sidecar-2/sanitize.py` -> `proxy.py` step 2a
 
 All three fixes run at `proxy.py` step **2a**, before pooled routing (2b):
 
@@ -104,4 +104,4 @@ All three fixes run at `proxy.py` step **2a**, before pooled routing (2b):
   Bedrock unchanged. If a future agentrouter release re-translates those
   fields, the rewrite will need to be revisited.
 
-Tests: `python -m unittest sidecar.tests.test_sanitize -v`.
+Tests: `python -m unittest discover -s sidecar-2.tests -v`.

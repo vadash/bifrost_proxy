@@ -8,13 +8,13 @@ sonnet / opus, case-insensitive):
    ``thinking`` text (``ValidationException: ...thinking: Field required``).
    Harnesses that stream responses often persist such blocks when a request
    aborts mid-thinking, then replay them forever — every retry 400s.
-   ``sanitize_claude_request`` strips those degenerate blocks.
+   ``strip_empty_thinking`` strips those degenerate blocks.
 
 2. **reasoning_effort shape.** OpenAI-format requests carrying
    ``reasoning_effort`` get translated by agentrouter to Bedrock's
    ``thinking.enabled``, which Opus 4.x rejects (``"thinking.enabled" is not
    supported for this model. Use thinking.adaptive and output_config.effort``).
-   ``rewrite_claude_reasoning_effort`` converts the OpenAI field to Bedrock's
+   ``rewrite_reasoning_effort`` converts the OpenAI field to Bedrock's
    native ``thinking={adaptive: true}`` + ``output_config.effort``.
 
 Both are deterministic, in-place (mutating the parsed dict matches the proxy's
@@ -47,7 +47,7 @@ def _is_empty_thinking(block: object) -> bool:
     return not (isinstance(text, str) and text.strip())
 
 
-def sanitize_claude_request(body: dict) -> int:
+def strip_empty_thinking(body: dict) -> int:
     """Strip empty ``thinking`` blocks from assistant messages. In-place.
 
     Returns the number of blocks removed (0 = body already clean; callers
@@ -86,7 +86,7 @@ def sanitize_claude_request(body: dict) -> int:
     return removed
 
 
-def rewrite_claude_reasoning_effort(body: dict) -> bool:
+def rewrite_reasoning_effort(body: dict) -> bool:
     """Convert OpenAI ``reasoning_effort`` to Bedrock-native thinking shape.
 
     Agentrouter translates a top-level ``reasoning_effort`` to Bedrock's
@@ -118,7 +118,7 @@ def rewrite_claude_reasoning_effort(body: dict) -> bool:
     return True
 
 
-def inject_bedrock_max_tokens(body: dict) -> bool:
+def mirror_max_tokens(body: dict) -> bool:
     """Copy ``max_completion_tokens`` -> ``max_tokens`` for Bedrock upstreams.
 
     Bedrock's Anthropic Messages API reads ``max_tokens`` (not OpenAI's
