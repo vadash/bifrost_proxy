@@ -55,6 +55,11 @@ first-skipped is the stampede/overload target.
 **Whole-chain failure** (`elif err_path`): 5xx/429/exception from the whole
 chain → cool the forced primary (`keep_list[0]`) and advance the pin one step.
 
+`apply_feedback` returns the provider it re-pinned to (`repin_to`, or
+`keep_list[1]` on the failure path), else `None` — threaded straight into the
+`repin` log field so logging never re-derives it from `state.pins` under a
+second lock (see runbook "sidecar.log record shape").
+
 ## `is_fallback` is NOT the signal; `fell_back` is
 
 `fallback_feedback` deliberately does **not** consult Bifrost's

@@ -1,8 +1,9 @@
-"""Tests for sidecar-2 sanitize — empty-thinking-block stripping.
+"""Tests for sidecar-2 sanitize — the three Claude-family body rewriters.
 
-These guard the observable contract: Bedrock's ``thinking: Field required``
-400 must no longer trigger for Claude-family requests carrying degenerate
-thinking blocks, and no other payload shape may be mutated.
+These guard the observable contract: empty-thinking-block stripping,
+``reasoning_effort`` -> Bedrock-native thinking shape, and
+``max_completion_tokens`` -> ``max_tokens`` mirroring must fire exactly when
+intended, and no other payload shape may be mutated.
 """
 
 from __future__ import annotations
@@ -224,6 +225,29 @@ class TestRewriteReasoningEffort(unittest.TestCase):
             with self.subTest(value=bad):
                 self.assertFalse(rewrite_reasoning_effort(body))
                 self.assertEqual(body["reasoning_effort"], bad)
+
+    def test_skips_when_explicit_thinking_empty_dict(self):
+        """An explicit empty ``thinking: {}`` is a deliberate client config -> forward as-is."""
+        body = {
+            "model": "claude-sonnet-4",
+            "reasoning_effort": "high",
+            "thinking": {},
+        }
+        before = copy.deepcopy(body)
+        self.assertFalse(rewrite_reasoning_effort(body))
+        self.assertEqual(body, before)
+        self.assertIn("reasoning_effort", body)
+
+    def test_still_skips_when_explicit_thinking_nonempty(self):
+        """Non-empty explicit thinking dict is likewise left untouched (locks both gate sides)."""
+        body = {
+            "model": "claude-sonnet-4",
+            "reasoning_effort": "high",
+            "thinking": {"adaptive": True},
+        }
+        before = copy.deepcopy(body)
+        self.assertFalse(rewrite_reasoning_effort(body))
+        self.assertEqual(body, before)
 
 
 class TestInjectBedrockMaxTokens(unittest.TestCase):

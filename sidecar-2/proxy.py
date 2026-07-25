@@ -127,6 +127,7 @@ class Handler(BaseHTTPRequestHandler):
         pin = None
         keep_list = None          # kept[] ring used in the request + step-8 feedback
         desperate = False
+        repin = None             # provider re-pinned this request (feedback), for logging
 
         try:
             # 1. Read request body.
@@ -220,10 +221,8 @@ class Handler(BaseHTTPRequestHandler):
 
             # --- 6b. Post-response feedback (pooled requests only). ---
             if pooled_model is not None:
-                apply_feedback(
+                repin = apply_feedback(
                     self._state,
-                    self._cfg,
-                    pooled_model=pooled_model,
                     session_key=session_key,
                     providers=providers,
                     keep_list=keep_list,
@@ -261,12 +260,12 @@ class Handler(BaseHTTPRequestHandler):
                     self.headers,
                     self.command,
                     self.path,
-                    pooled_model=pooled_model,
                     session_key=session_key,
                     session_source=session_source,
                     pin=pin,
                     keep_list=keep_list,
                     served_provider=served_provider,
+                    repin=repin,
                     response_status=response_status,
                     is_stream=is_stream,
                     request_body_parsed=request_body_parsed,

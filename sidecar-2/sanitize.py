@@ -1,6 +1,6 @@
 """Request-body sanitization for provider 400 rejections.
 
-Two independent fixes, both gated on a Claude-family model name (claude /
+Three independent fixes, all gated on a Claude-family model name (claude /
 sonnet / opus, case-insensitive):
 
 1. **Empty thinking blocks.** Anthropic Messages API + AWS Bedrock reject
@@ -17,8 +17,15 @@ sonnet / opus, case-insensitive):
    ``rewrite_reasoning_effort`` converts the OpenAI field to Bedrock's
    native ``thinking={adaptive: true}`` + ``output_config.effort``.
 
-Both are deterministic, in-place (mutating the parsed dict matches the proxy's
-pooled-rewrite pattern), and only act when a rewrite is actually needed.
+3. **max_tokens mirroring.** Bedrock's Anthropic Messages API reads
+   ``max_tokens``, not OpenAI's ``max_completion_tokens``; agentrouter
+   doesn't translate the field, so requests cap at Bedrock's 8192 default
+   (``stop_reason: max_tokens`` at exactly 8192 output tokens).
+   ``mirror_max_tokens`` copies the value under the Bedrock-native name.
+
+All three are deterministic, in-place (mutating the parsed dict matches the
+proxy's pooled-rewrite pattern), and only act when a rewrite is actually
+needed.
 """
 
 from __future__ import annotations
@@ -106,8 +113,9 @@ def rewrite_reasoning_effort(body: dict) -> bool:
     effort = body.get("reasoning_effort")
     if not isinstance(effort, str):
         return False
-    existing = body.get("thinking")
-    if isinstance(existing, dict) and existing:
+    # Any explicit ``thinking`` dict -- even ``{}`` -- means the client specified
+    # thinking config directly; forward as-is.
+    if isinstance(body.get("thinking"), dict):
         return False
 
     body.pop("reasoning_effort", None)

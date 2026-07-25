@@ -110,10 +110,6 @@ class RoutingState:
             self.cooldowns.get(provider, 0), now + secs
         )
 
-    def derive_session_key(self, body: dict) -> tuple[str, str]:
-        """Return ``(session_key, source)`` via the identity cascade."""
-        return derive_session_key(body)
-
     def assign_pin(
         self, session_key: str, providers: list[str], now: float
     ) -> int:
@@ -251,7 +247,7 @@ def plan_pooled_request(
     providers = state.pools[pooled_model]
     with state.lock():
         state.purge_expired(now)
-        session_key, session_source = state.derive_session_key(parsed)
+        session_key, session_source = derive_session_key(parsed)
         pin = state.assign_pin(session_key, providers, now)
         keep_list, desperate = state.build_send_order(providers, pin, now)
 

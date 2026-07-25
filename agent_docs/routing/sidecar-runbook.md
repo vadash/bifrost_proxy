@@ -100,7 +100,11 @@ session, source, pin, primary, ring, cooldowns, served, fell_back, repin,
 status, desperate.
 `session` is the key truncated to 12 chars; `ring` is the kept send-order list
 for this request; `fell_back` is the derived fallback indicator (`is_fallback`
-is never emitted by this Bifrost build and is not logged).
+is never emitted by this Bifrost build and is not logged). `repin` is the
+provider this request actually re-pinned the session to (returned by
+`apply_feedback`), else `null` when no re-pin happened — it does NOT echo the
+session's standing pin. A steady session (served by its primary, no fallback)
+logs `repin: null` even though it stays pinned.
 
 ## Files
 

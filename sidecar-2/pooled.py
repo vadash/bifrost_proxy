@@ -26,26 +26,24 @@ from .state import RoutingState, fallback_feedback
 
 def apply_feedback(
     state: RoutingState,
-    cfg: SidecarConfig,
     *,
-    pooled_model: str,
     session_key: str,
     providers: list[str],
     keep_list: list[str],
     served_provider: str | None,
     response_status: int | None,
     error_str: str | None,
-) -> None:
+) -> str | None:
     """Adjust pin + cooldowns after Bifrost replies.
 
     ``served_provider`` is the provider name extracted from the response
     body (or None when the terminal event never arrived -- a normal
     outcome, in which case the fallback path is skipped).
-    """
-    # ``pooled_model`` is intentionally accepted for call-site parity with
-    # ``write_logs`` and the proxy's plan dict, but is not consulted here.
-    del pooled_model, cfg
 
+    Returns the provider actually re-pinned to this request (``repin_to``,
+    or ``keep_list[1]`` on the whole-chain-failure path), else ``None`` when
+    nothing was re-pinned -- the decided value the logger records verbatim.
+    """
     now_fb = time.time()
     served = served_provider
 
@@ -53,6 +51,7 @@ def apply_feedback(
         keep_list, served, response_status
     )
 
+    repinned: str | None = None
     with state.lock():
         state.purge_expired(now_fb)
         err_path = (
@@ -66,11 +65,14 @@ def apply_feedback(
             if cool_provider is not None:
                 state.cooldown_trigger(cool_provider, now_fb)
             state.re_pin(session_key, repin_to, providers, now_fb)
+            repinned = repin_to
         elif err_path:
             # Whole chain failed: cool the forced primary; advance one step.
             state.cooldown_trigger(keep_list[0], now_fb)
             if len(keep_list) > 1:
                 state.re_pin(session_key, keep_list[1], providers, now_fb)
+                repinned = keep_list[1]
+    return repinned
 
 
 def write_logs(
@@ -82,12 +84,12 @@ def write_logs(
     command: str,
     path: str,
     *,
-    pooled_model: str,
     session_key: str,
     session_source: str,
     pin: int,
     keep_list: list[str] | None,
     served_provider: str | None,
+    repin: str | None,
     response_status: int | None,
     is_stream: bool | None,
     request_body_parsed,
@@ -122,16 +124,8 @@ def write_logs(
         and bool(keep_list)
         and served != keep_list[0]
     )
-    # Reconstruct repin from pin/served for observability.
     now_log = time.time()
     with state.lock():
-        entry = state.pins.get(session_key)
-        repin = None
-        if entry is not None:
-            repin_idx = entry["pin"]
-            providers = state.pools.get(pooled_model)
-            if providers is not None and 0 <= repin_idx < len(providers):
-                repin = providers[repin_idx]
         hot = [
             p for p in keep_list
             if state.cooldown_is_hot(p, now_log)

@@ -52,10 +52,14 @@ anything:
 - Sets `output_config.effort = <original value>`, preserving any other keys
   already on `output_config`.
 
-**Skipped** when the request already has an explicit `thinking` dict — that's
-an Anthropic-format request that already specifies thinking config directly
-and must be forwarded as-is. Also a no-op when `reasoning_effort` is absent
-or non-string.
+**Skipped** when the request already carries an explicit `thinking` dict —
+that's an Anthropic-format request that already specifies thinking config
+directly and must be forwarded as-is. The gate is *any* dict, including an
+empty `{}`: an explicit `thinking: {}` counts as a deliberate client choice
+and passes through untouched (the gate is `isinstance(body.get("thinking"),
+dict)`, NOT `... and body["thinking"]` — a truthiness check would clobber
+`{}` and contradict this contract). Also a no-op when `reasoning_effort` is
+absent or non-string.
 
 ## Fix 3 — `max_tokens` mirroring
 
