@@ -10,7 +10,11 @@ from __future__ import annotations
 import copy
 import unittest
 
-from sidecar.sanitize import model_needs_sanitize, sanitize_claude_request
+from sidecar.sanitize import (
+    model_needs_sanitize,
+    rewrite_claude_reasoning_effort,
+    sanitize_claude_request,
+)
 
 
 def _msg(role, content):
@@ -168,6 +172,53 @@ class TestSanitizeClaudeRequest(unittest.TestCase):
         # remaining assistants kept their text
         self.assertEqual(body["messages"][1]["content"], [_text("a")])
         self.assertEqual(body["messages"][4]["content"], [_text("b")])
+
+
+class TestRewriteReasoningEffort(unittest.TestCase):
+    """``rewrite_claude_reasoning_effort`` — OpenAI -> Bedrock-native shape."""
+
+    def test_rewrites_medium_to_adaptive_plus_effort(self):
+        """The exact failure from the 400 log: reasoning_effort=medium, no thinking."""
+        body = {
+            "model": "agentrouter-01/claude-opus-4-8",
+            "messages": [{"role": "user", "content": "hi"}],
+            "reasoning_effort": "medium",
+            "max_completion_tokens": 64000,
+        }
+        self.assertTrue(rewrite_claude_reasoning_effort(body))
+        self.assertNotIn("reasoning_effort", body)
+        self.assertEqual(body["thinking"], {"adaptive": True})
+        self.assertEqual(body["output_config"], {"effort": "medium"})
+        # untouched fields stay untouched
+        self.assertEqual(body["max_completion_tokens"], 64000)
+
+    def test_preserves_existing_output_config_keys(self):
+        body = {"reasoning_effort": "high", "output_config": {"foo": "bar"}}
+        self.assertTrue(rewrite_claude_reasoning_effort(body))
+        self.assertEqual(body["output_config"], {"foo": "bar", "effort": "high"})
+
+    def test_skips_when_explicit_thinking_present(self):
+        """Anthropic-format request with explicit thinking is left alone."""
+        body = {
+            "reasoning_effort": "medium",
+            "thinking": {"type": "enabled", "budget_tokens": 10000},
+        }
+        before = copy.deepcopy(body)
+        self.assertFalse(rewrite_claude_reasoning_effort(body))
+        self.assertEqual(body, before)
+
+    def test_skips_when_no_reasoning_effort(self):
+        body = {"model": "claude-opus-4-8", "messages": []}
+        before = copy.deepcopy(body)
+        self.assertFalse(rewrite_claude_reasoning_effort(body))
+        self.assertEqual(body, before)
+
+    def test_skips_non_string_effort(self):
+        for bad in (None, 5, True, ["medium"]):
+            body = {"reasoning_effort": bad}
+            with self.subTest(value=bad):
+                self.assertFalse(rewrite_claude_reasoning_effort(body))
+                self.assertEqual(body["reasoning_effort"], bad)
 
 
 if __name__ == "__main__":

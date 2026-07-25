@@ -22,7 +22,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from .config import HOP_BY_HOP, SidecarConfig
 from .io_jsonl import JsonlWriter, parse_request_body, redact_headers
 from .meta import parse_response_meta_nonstream, parse_response_meta_stream
-from .sanitize import model_needs_sanitize, sanitize_claude_request
+from .sanitize import (
+    model_needs_sanitize,
+    rewrite_claude_reasoning_effort,
+    sanitize_claude_request,
+)
 from .state import RoutingState, fallback_feedback
 
 
@@ -269,15 +273,21 @@ class Handler(BaseHTTPRequestHandler):
             state = self._state
             forward_body = body  # default: verbatim passthrough
 
-            # 2a. Claude-family fix: strip empty thinking blocks that
-            # Bedrock/Anthropic reject with 400 ("thinking: Field
-            # required"). Applies to pooled AND passthrough requests;
-            # re-serialize only when a block was actually removed, so
-            # clean passthrough stays byte-verbatim.
+            # 2a. Claude-family fixes (pooled AND passthrough):
+            #   - strip empty thinking blocks ("thinking: Field required" 400)
+            #   - rewrite OpenAI reasoning_effort -> Bedrock thinking.adaptive
+            #     + output_config.effort ("thinking.enabled is not supported" 400)
+            # Re-serialize only when something actually changed, so clean
+            # passthrough stays byte-verbatim.
             if isinstance(request_body_parsed, dict) and model_needs_sanitize(
                 request_body_parsed.get("model")
             ):
-                if sanitize_claude_request(request_body_parsed):
+                changed = sanitize_claude_request(request_body_parsed) > 0
+                changed = (
+                    rewrite_claude_reasoning_effort(request_body_parsed)
+                    or changed
+                )
+                if changed:
                     forward_body = json.dumps(request_body_parsed).encode("utf-8")
 
             # --- 2b. Optional pooled routing: rewrite model+fallbacks,

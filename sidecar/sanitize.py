@@ -1,17 +1,24 @@
 """Request-body sanitization for provider 400 rejections.
 
-Claude-family models (Anthropic Messages API + AWS Bedrock) reject assistant
-turns that contain ``thinking`` blocks with empty or missing ``thinking``
-text: Bedrock raises ``ValidationException: ...thinking: Field required``.
-Harnesses that stream responses often persist such blocks when a request
-aborts mid-thinking, then replay them forever — every retry 400s.
+Two independent fixes, both gated on a Claude-family model name (claude /
+sonnet / opus, case-insensitive):
 
-This module strips those degenerate blocks for any request whose model name
-mentions claude/sonnet/opus (case-insensitive). Blocks with real thinking
-text are preserved; other content (text, tool_use, tool_result) is untouched.
+1. **Empty thinking blocks.** Anthropic Messages API + AWS Bedrock reject
+   assistant turns that contain ``thinking`` blocks with empty or missing
+   ``thinking`` text (``ValidationException: ...thinking: Field required``).
+   Harnesses that stream responses often persist such blocks when a request
+   aborts mid-thinking, then replay them forever — every retry 400s.
+   ``sanitize_claude_request`` strips those degenerate blocks.
 
-Deterministic, in-place (mutates the parsed dict, matching the proxy's pooled
-rewrite pattern), and only called when a rewrite is actually needed.
+2. **reasoning_effort shape.** OpenAI-format requests carrying
+   ``reasoning_effort`` get translated by agentrouter to Bedrock's
+   ``thinking.enabled``, which Opus 4.x rejects (``"thinking.enabled" is not
+   supported for this model. Use thinking.adaptive and output_config.effort``).
+   ``rewrite_claude_reasoning_effort`` converts the OpenAI field to Bedrock's
+   native ``thinking={adaptive: true}`` + ``output_config.effort``.
+
+Both are deterministic, in-place (mutating the parsed dict matches the proxy's
+pooled-rewrite pattern), and only act when a rewrite is actually needed.
 """
 
 from __future__ import annotations
@@ -77,3 +84,35 @@ def sanitize_claude_request(body: dict) -> int:
     if removed:
         body["messages"] = new_messages
     return removed
+
+
+def rewrite_claude_reasoning_effort(body: dict) -> bool:
+    """Convert OpenAI ``reasoning_effort`` to Bedrock-native thinking shape.
+
+    Agentrouter translates a top-level ``reasoning_effort`` to Bedrock's
+    ``thinking.enabled``, which Opus 4.x rejects with ``"thinking.enabled" is
+    not supported for this model``. Bedrock wants ``thinking.adaptive`` +
+    ``output_config.effort`` instead. Rewrite accordingly and drop the
+    original OpenAI field so the upstream translator has nothing to misrender.
+
+    Skips when the request already carries an explicit ``thinking`` dict —
+    that's an Anthropic-format request that already specifies thinking config
+    directly and should be forwarded as-is.
+
+    Returns True when the body was modified (caller re-serializes).
+    """
+    effort = body.get("reasoning_effort")
+    if not isinstance(effort, str):
+        return False
+    existing = body.get("thinking")
+    if isinstance(existing, dict) and existing:
+        return False
+
+    body.pop("reasoning_effort", None)
+    body["thinking"] = {"adaptive": True}
+    out_cfg = body.get("output_config")
+    if not isinstance(out_cfg, dict):
+        out_cfg = {}
+    out_cfg["effort"] = effort
+    body["output_config"] = out_cfg
+    return True

@@ -25,5 +25,6 @@ declared in `sidecar/pools.json`. Non-pooled = verbatim passthrough, no logs
 4. **[sidecar-runbook.md](sidecar-runbook.md)** — run + verify sidecar
    (incl. `python -m unittest sidecar.tests.test_routing -v`).
 5. **[request-sanitization.md](request-sanitization.md)** — why passthrough is
-   no longer 100% verbatim: Bedrock 400s on empty `thinking` blocks, and
-   `sidecar/sanitize.py` strips them for claude/sonnet/opus models.
+   no longer 100% verbatim: Bedrock 400s on empty `thinking` blocks and on
+   OpenAI `reasoning_effort`, and `sidecar/sanitize.py` rewrites both for
+   claude/sonnet/opus models.
