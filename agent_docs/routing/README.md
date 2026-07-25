@@ -14,6 +14,10 @@ bodies by `routing_info.py::extract_provider`. Pooled models declared in
 `sidecar-2/pools.json`. Non-pooled = verbatim passthrough, no logs (one
 exception: Claude empty-thinking sanitize — see #5 below).
 
+Second baseUrl `/fast/v1/...` races pooled models over two disjoint lanes
+(odd/even ring split, two session pins, per-lane feedback, biggest-partial
+fallback) — see **[fast-race-endpoint.md](fast-race-endpoint.md)**.
+
 ## Read these first
 
 1. **[bifrost-routing-facts.md](bifrost-routing-facts.md)** — Bifrost routing
@@ -32,3 +36,5 @@ exception: Claude empty-thinking sanitize — see #5 below).
    no longer 100% verbatim: Bedrock 400s on empty `thinking` blocks and on
    OpenAI `reasoning_effort`, and `sidecar-2/sanitize.py` rewrites both for
    claude/sonnet/opus models.
+6. **[fast-race-endpoint.md](fast-race-endpoint.md)** — `/fast/v1` two-lane
+   race: lane construction, dual pins, winner selection, per-lane feedback.

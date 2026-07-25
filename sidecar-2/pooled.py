@@ -22,6 +22,7 @@ import time
 from .config import SidecarConfig
 from .io_jsonl import JsonlWriter, redact_headers
 from .state import RoutingState, fallback_feedback
+from .fast import fast_lane_feedback
 
 
 def apply_feedback(
@@ -72,6 +73,57 @@ def apply_feedback(
             if len(keep_list) > 1:
                 state.re_pin(session_key, keep_list[1], providers, now_fb)
                 repinned = keep_list[1]
+    return repinned
+
+
+def apply_fast_feedback(
+    state: RoutingState,
+    *,
+    session_key: str,
+    providers: list[str],
+    lane: str,
+    lane_keep: list[str],
+    served_provider: str | None,
+    response_status: int | None,
+    error_str: str | None,
+) -> str | None:
+    """Adjust one lane's pin slot + cooldowns after its race leg replies.
+
+    Same shape and lock discipline as ``apply_feedback``, but uses the
+    fast-lane rule (``fast_lane_feedback``): on 2xx fallback the lane
+    primary AND skipped intermediates are cooled and the lane re-pins to
+    the server; on the error path (transport error, 5xx, or 429 -- the
+    same predicate as ``apply_feedback``) the lane primary is cooled and
+    the lane advances to ``lane_keep[1]``. Other non-2xx (4xx except 429)
+    produce no feedback -- mirrors the single path deliberately.
+
+    Returns the provider the lane slot was re-pinned to, else ``None``.
+    """
+    now_fb = time.time()
+    repin_to, cool_list = fast_lane_feedback(
+        lane_keep, served_provider, response_status
+    )
+
+    repinned: str | None = None
+    with state.lock():
+        state.purge_expired(now_fb)
+        err_path = (
+            error_str is not None
+            or (response_status is not None and response_status >= 500)
+            or (response_status == 429)
+        )
+        if repin_to is not None:
+            for p in cool_list:
+                state.cooldown_trigger(p, now_fb)
+            state.re_pin_lane(session_key, repin_to, providers, lane, now_fb)
+            repinned = repin_to
+        elif err_path:
+            state.cooldown_trigger(lane_keep[0], now_fb)
+            if len(lane_keep) > 1:
+                state.re_pin_lane(
+                    session_key, lane_keep[1], providers, lane, now_fb
+                )
+                repinned = lane_keep[1]
     return repinned
 
 

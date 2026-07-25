@@ -110,54 +110,181 @@ class RoutingState:
             self.cooldowns.get(provider, 0), now + secs
         )
 
+    def _least_loaded(
+        self,
+        providers: list[str],
+        now: float,
+        exclude: frozenset[int],
+    ) -> int | None:
+        """Least-loaded cold provider index, skipping ``exclude``.
+
+        Load counts every live pin (inactivity <= session_ttl) on the index,
+        including second pins (``pin2``) from fast sessions so they count as
+        load too. Cold candidates first; when all hot, fall back to ALL
+        indices (desperate) minus ``exclude``. Tie -> uniform-random choice
+        (so a fresh pool doesn't stampede every session onto the lowest-index
+        provider on cold start). Returns ``None`` when no candidate remains
+        (only possible with a non-empty ``exclude``). Must be called under
+        ``self.lock()``.
+        """
+        load = [0] * len(providers)
+        ttl = self._cfg.session_ttl
+        for v in self.pins.values():
+            if now - v["seen"] > ttl:
+                continue
+            for key in ("pin", "pin2"):
+                idx = v.get(key)
+                if idx is not None and 0 <= idx < len(providers):
+                    load[idx] += 1
+
+        candidates = [
+            i for i in range(len(providers))
+            if i not in exclude and not self.cooldown_is_hot(providers[i], now)
+        ]
+        if not candidates:
+            # desperate: all hot, still land somewhere
+            candidates = [
+                i for i in range(len(providers)) if i not in exclude
+            ]
+        if not candidates:
+            return None
+        min_load = min(load[i] for i in candidates)
+        tied = [i for i in candidates if load[i] == min_load]
+        return tied[0] if len(tied) == 1 else self._rng.choice(tied)
+
     def assign_pin(
         self, session_key: str, providers: list[str], now: float
     ) -> int:
         """Return the pinned provider index for ``session_key``.
 
-        If known, refresh ``seen`` and return the stored pin; else compute
-        least-loaded start: fewest live pinned sessions among cold providers,
-        tie -> uniform-random choice (so a fresh pool doesn't stampede every
-        session onto the lowest-index provider on cold start); if all hot,
-        fall back to all indices. Store + return the pin. Must be called
-        under ``self.lock()``.
+        If known, refresh ``seen`` and return the stored pin; else compute a
+        least-loaded start (see ``_least_loaded``), store ``{"pin", "seen"}``
+        (no ``pin2`` key -- fast sessions add it via ``assign_pin_pair``),
+        and return the pin. Must be called under ``self.lock()``.
         """
         if session_key in self.pins:
             self.pins[session_key]["seen"] = now
             return self.pins[session_key]["pin"]
 
-        load = [0] * len(providers)
-        ttl = self._cfg.session_ttl
-        for v in self.pins.values():
-            idx = v["pin"]
-            if 0 <= idx < len(providers) and now - v["seen"] <= ttl:
-                load[idx] += 1
-
-        candidates = [
-            i for i in range(len(providers))
-            if not self.cooldown_is_hot(providers[i], now)
-        ]
-        if not candidates:
-            # desperate: all hot, still land somewhere
-            candidates = list(range(len(providers)))
-        min_load = min(load[i] for i in candidates)
-        tied = [i for i in candidates if load[i] == min_load]
-        pin = tied[0] if len(tied) == 1 else self._rng.choice(tied)
+        pin = self._least_loaded(providers, now, frozenset())
         self.pins[session_key] = {"pin": pin, "seen": now}
         return pin
+
+    def assign_pin_pair(
+        self, session_key: str, providers: list[str], now: float
+    ) -> tuple[int, int | None]:
+        """Return ``(pin_a, pin_b)`` for a fast two-lane session.
+
+        Existing record: refresh ``seen``; validate both pins are in range
+        (out-of-range treated as missing). Missing ``pin2`` in a multi-provider
+        pool gets a fresh least-loaded assignment excluding ``pin_a``. New
+        session: both pins assigned least-loaded (``pin_b`` excludes
+        ``pin_a``). ``pin_b`` is ``None`` only for a 1-provider pool. The
+        record keeps the shape ``{"pin", "pin2", "seen"}`` (``pin2`` omitted
+        for 1-provider pools). Must be called under ``self.lock()``.
+        """
+        record = self.pins.get(session_key)
+        if record is not None:
+            record["seen"] = now
+            pin_a = record["pin"]
+            if not 0 <= pin_a < len(providers):
+                pin_a = self._least_loaded(providers, now, frozenset())
+                record["pin"] = pin_a
+            pin_b = record.get("pin2")
+            if pin_b is not None and not 0 <= pin_b < len(providers):
+                pin_b = None
+            if pin_b is None and len(providers) > 1:
+                pin_b = self._least_loaded(
+                    providers, now, frozenset({pin_a})
+                )
+            if pin_b is not None:
+                record["pin2"] = pin_b
+            return pin_a, pin_b
+
+        pin_a = self._least_loaded(providers, now, frozenset())
+        pin_b = (
+            self._least_loaded(providers, now, frozenset({pin_a}))
+            if len(providers) > 1
+            else None
+        )
+        record = {"pin": pin_a, "seen": now}
+        if pin_b is not None:
+            record["pin2"] = pin_b
+        self.pins[session_key] = record
+        return pin_a, pin_b
 
     def re_pin(
         self, session_key: str, provider: str, providers: list[str],
         now: float,
     ) -> None:
         """Re-pin ``session_key`` to ``provider``'s index. No-op if the
-        provider isn't in ``providers``. Must be called under ``self.lock()``.
+        provider isn't in ``providers``. Preserves an existing ``pin2``
+        (fast sessions' second pin). Must be called under ``self.lock()``.
         """
         if provider in providers:
-            self.pins[session_key] = {
+            old = self.pins.get(session_key) or {}
+            record = {
                 "pin": providers.index(provider),
                 "seen": now,
             }
+            if old.get("pin2") is not None:
+                record["pin2"] = old["pin2"]
+            self.pins[session_key] = record
+
+    def re_pin_lane(
+        self,
+        session_key: str,
+        provider: str,
+        providers: list[str],
+        lane: str,
+        now: float,
+    ) -> None:
+        """Re-pin one lane slot (``"a"`` -> ``pin``, ``"b"`` -> ``pin2``)
+        of ``session_key`` to ``provider``'s index, preserving the other slot
+        and refreshing ``seen``. No-op when ``provider`` isn't in
+        ``providers`` or the session record is gone. Must be called under
+        ``self.lock()``.
+        """
+        if provider not in providers:
+            return
+        record = self.pins.get(session_key)
+        if record is None:
+            return
+        record["seen"] = now
+        if lane == "a":
+            record["pin"] = providers.index(provider)
+        else:
+            record["pin2"] = providers.index(provider)
+
+    def build_fast_lanes(
+        self,
+        providers: list[str],
+        pin_a: int,
+        pin_b: int | None,
+        now: float,
+    ) -> tuple[list[str], list[str], bool]:
+        """Split the session's send-order ring odd/even into two lanes.
+
+        ``ring, desperate = build_send_order(providers, pin_a, now)``; when
+        ``pin_b`` is set, cold, and not already at ring position 0, it is
+        swapped into position 1 (lane B's primary). Lane A takes
+        ``ring[0::2][:3]``, lane B ``ring[1::2][:3]`` -- the odd/even split
+        AND the upstream cap (primary + 2 fallbacks; see
+        ``agent_docs/routing/sidecar-routing-policy.md``). ``lane_b`` is
+        ``[]`` only for a 1-provider pool. Must be called under
+        ``self.lock()`` (reads ``cooldowns``).
+        """
+        ring, desperate = self.build_send_order(providers, pin_a, now)
+        if (
+            pin_b is not None
+            and providers[pin_b] != ring[0]
+            and not self.cooldown_is_hot(providers[pin_b], now)
+        ):
+            idx = ring.index(providers[pin_b])
+            ring[1], ring[idx] = ring[idx], ring[1]
+        lane_a = ring[0::2][:3]
+        lane_b = ring[1::2][:3]
+        return lane_a, lane_b, desperate
 
     def build_send_order(
         self, providers: list[str], pin: int, now: float
