@@ -12,7 +12,9 @@ from __future__ import annotations
 
 import argparse
 import os
+import signal
 import sys
+import threading
 
 from .config import SidecarConfig, load_pools
 from .io_jsonl import JsonlWriter
@@ -157,10 +159,41 @@ def main(argv: list[str] | None = None) -> int:
     server.capture_writer = capture_writer
     server.log_writer = log_writer
 
+    # Graceful shutdown: a signal handler triggers server.shutdown() from a
+    # side thread (calling shutdown() from the serve_forever thread deadlocks),
+    # then the finally closes the socket and writers. Re-entrancy guard so a
+    # second signal doesn't spawn a second shutdown thread. SIGINT also raises
+    # KeyboardInterrupt on the main thread *before* the handler can run on
+    # Windows -- the except arm drives the same path.
+    _shutdown_started = threading.Event()
+
+    def _trigger_shutdown(signum=None, frame=None):
+        if _shutdown_started.is_set():
+            return
+        _shutdown_started.set()
+        print("\n[sidecar] shutting down ...", flush=True)
+        threading.Thread(target=server.shutdown, daemon=True).start()
+
+    for _sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            signal.signal(_sig, _trigger_shutdown)
+        except (ValueError, OSError):
+            # Rejected on this platform/build -- SIGINT on Windows still raises
+            # KeyboardInterrupt, so graceful drain works even if both registrations
+            # fail. Never let a signal registration prevent startup.
+            pass
+
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        print("\n[sidecar] shutting down")
+        # Windows may deliver Ctrl-C here before the handler runs -- drive the
+        # same shutdown path; if the handler already started it, this is a no-op.
+        _trigger_shutdown()
+    finally:
+        server.server_close()
+        capture_writer.close()
+        log_writer.close()
+        print("[sidecar] stopped")
     return 0
 
 

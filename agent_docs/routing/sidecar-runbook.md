@@ -1,6 +1,6 @@
 # Sidecar Runbook
 
-Run + verify Bifrost routing sidecar (v2.2, Bifrost-tfz).
+Run + verify Bifrost routing sidecar (v2.2 lineage; package `__version__=2.3.0`).
 
 ## What it is
 
@@ -56,6 +56,25 @@ application `C:\Users\vadash\AppData\Local\Python\pythoncore-3.14-64\python.exe`
 args `["-m","sidecar-2","--reserve-bifrost","3"]`, ready on log `listening on`.
 Banner: `[sidecar] listening on http://127.0.0.1:8088 -> http://127.0.0.1:8080
 pooled_models=N ...`. `pools.json` is startup-only — edits require restart.
+
+## Graceful shutdown (Ctrl-C / SIGTERM)
+
+`__main__.py:main()` installs SIGINT + SIGTERM handlers that call
+`server.shutdown()` from a side thread (calling it from the `serve_forever`
+thread deadlocks), then a `finally` runs `server.server_close()` and closes
+both `JsonlWriter`s. So Ctrl-C and `kill -INT <pid>` both drain cleanly:
+print `[sidecar] shutting down ...` then `[sidecar] stopped`, exit in <1s,
+free the listening socket, flush `sidecar.log`. A second signal is a no-op
+(Event-guarded, one-shot shutdown thread).
+
+**Windows quirk.** `os.kill(pid, signal.SIGTERM)` calls `TerminateProcess`
+directly and bypasses Python signal handlers — the process dies with NO
+`shutting down` banner and the writers' `finally` does NOT run. To exercise
+the graceful path on Windows, send a console Ctrl-C event (Ctrl-C in the
+foreground terminal, or hub `send` with `keys:["CTRL_C"]`); SIGINT raises
+`KeyboardInterrupt` on the main thread and the `except KeyboardInterrupt`
+arm drives the same drain. `stop_sidecar.cmd` keeps `taskkill /F` as the
+last-resort hammer for a wedged process that ignores SIGTERM/SIGINT.
 
 ## Repoint client
 
@@ -162,6 +181,30 @@ provider this request actually re-pinned the session to (returned by
 `apply_feedback`), else `null` when no re-pin happened — it does NOT echo the
 session's standing pin. A steady session (served by its primary, no fallback)
 logs `repin: null` even though it stays pinned.
+
+## JsonlWriter: persistent handle + fsync daemon (`io_jsonl.py`)
+
+`JsonlWriter` keeps a single append handle open for its lifetime (lazily
+opened on first `write`) — the old open()+flush()+close() per record was
+pure syscall overhead on the hot pooled path. `write()` still flushes after
+every record, so a process kill leaves a complete line on disk; **only
+`fsync` is deferred to a timer.**
+
+Module-level `_FsyncScheduler` is a single daemon thread (`name=
+"sidecar-fsync"`) started lazily on the first `JsonlWriter` registration.
+Every `config.FSYNC_INTERVAL_SECS` (5.0s) it `os.fsync`s each live writer's
+handle under that writer's lock, swallowing `OSError` (handle may be closed
+or a redirected pipe). Set `FSYNC_INTERVAL_SECS=0` to disable (skips thread
+spawn entirely).
+
+Lifecycle contracts worth knowing before touching `io_jsonl.py`:
+- `close()` is idempotent and unregisters from the scheduler. `__del__`
+  backstops callers that forget to close — it swallows all errors and never
+  replaces an explicit `close()`.
+- **Windows + tests.** An open file handle blocks `shutil.rmtree` with
+  `PermissionError`. `test_handler.py::tearDown` calls `capture_writer.close()`
+  + `log_writer.close()` AFTER `server_close()` — keep that ordering when
+  you add new live-server tests, or the tempdir teardown wedges on Windows.
 
 ## Files
 

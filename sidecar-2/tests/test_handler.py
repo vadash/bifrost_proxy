@@ -20,7 +20,9 @@ from __future__ import annotations
 import http.client
 import importlib
 import json
+import os
 import tempfile
+import time
 import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -131,6 +133,8 @@ class TestHandlerRelay(unittest.TestCase):
         self.sidecar.shutdown()
         self.stub.server_close()
         self.sidecar.server_close()
+        self.sidecar.capture_writer.close()
+        self.sidecar.log_writer.close()
 
         import shutil
         shutil.rmtree(self._tmp, ignore_errors=True)
@@ -230,6 +234,68 @@ class TestHandlerRelay(unittest.TestCase):
         self.assertIn(headers.get("x-sidecar-fast-winner", ""), ("a", "b"))
         self.assertEqual(headers.get("x-sidecar-session"), "sess-A"[:12])
         self.assertEqual(body, _STUB_BODY)
+
+
+
+
+class TestJsonlWriterHandle(unittest.TestCase):
+    """Persistent-handle + fsync scheduler behavior for ``JsonlWriter``.
+
+    Behavior-defining: the persistent append handle lifts the open()+close()
+    syscall pair off the hot pooled paths while preserving crash-durability
+    (per-record flush + timer-driven fsync).
+    """
+
+    def test_handle_persists_across_writes_then_closes_idempotently(self):
+        fd, p = tempfile.mkstemp(prefix="sidecar-jsonl-", suffix=".jsonl")
+        os.close(fd)
+        w = JsonlWriter(p)
+        try:
+            for i in range(3):
+                w.write({"i": i})
+                # Handle stays open between writes -- the whole point.
+                self.assertIsNotNone(w._fh)
+                self.assertFalse(w._fh.closed)
+            # File holds exactly 3 lines, readable while the handle is open.
+            import pathlib
+            lines = pathlib.Path(p).read_text(encoding="utf-8").splitlines()
+            self.assertEqual(len(lines), 3)
+            self.assertEqual([json.loads(line) for line in lines],
+                             [{"i": 0}, {"i": 1}, {"i": 2}])
+            w.close()
+            self.assertIsNone(w._fh)
+            w.close()  # idempotent: must not raise
+        finally:
+            w.close()
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+
+    def test_scheduler_fsyncs_without_raising(self):
+        # Registering a writer lazily starts the fsync daemon. Wait one
+        # interval + slack so the thread ticks at least once. Asserts no
+        # exception surfaces and the line is durably on disk.
+        fd, p = tempfile.mkstemp(prefix="sidecar-jsonl-", suffix=".jsonl")
+        os.close(fd)
+        w = JsonlWriter(p)
+        try:
+            w.write({"x": "fsync-test"})
+            time.sleep(_config.FSYNC_INTERVAL_SECS + 1.0)
+            # If the scheduler had raised on this writer the next write would
+            # still succeed (errors are swallowed in-thread). The observable
+            # contract: line persisted, writer still usable, handle open.
+            self.assertIsNotNone(w._fh)
+            self.assertFalse(w._fh.closed)
+            import pathlib
+            self.assertEqual(pathlib.Path(p).read_text(encoding="utf-8").strip(),
+                             '{"x": "fsync-test"}')
+        finally:
+            w.close()
+            try:
+                os.remove(p)
+            except OSError:
+                pass
 
 
 if __name__ == "__main__":

@@ -15,6 +15,9 @@ from typing import Any
 
 _DIRNAME = os.path.dirname(os.path.abspath(__file__))
 
+# JsonlWriter fsync cadence (s). Timer-driven fsync is best-effort; per-record
+# flush() already guarantees process-kill durability. 0 disables the scheduler.
+FSYNC_INTERVAL_SECS: float = 5.0
 # Hop-by-hop headers per RFC 7230 §6.1 -- never forwarded end-to-end.
 HOP_BY_HOP: frozenset[str] = frozenset({
     "connection",
@@ -57,6 +60,7 @@ class SidecarConfig:
     default_cooldown: float = 600.0  # provider cooldown duration (s)
     upstream_timeout: float = 600.0  # per-upstream request timeout (s)
     chunk_size: int = 8192         # stream relay chunk size (bytes)
+
 
     pools: dict[str, list[str]] = field(default_factory=dict)
 
