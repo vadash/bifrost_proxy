@@ -99,6 +99,22 @@ cooldown regression, cold-start pin spread, `shuffle_pools`,
 `load_pools(reserve_bifrost=N)`, sanitize rewrites, and `extract_provider`
 against recorded SSE fixtures.
 
+`tests/test_handler.py` adds end-to-end transport coverage: an in-process
+`StubBifrost(ThreadingHTTPServer)` + the real `Sidecar` threaded server,
+asserting the single-path and `/fast` relays both work over real sockets
+(`tests/test_handler.py::TestHandlerRelay`). The single-path test is the
+regression test for the `resp.getheaders` bound-method-passed-uncalled bug
+in `_filter_response_headers`. Do not add a third test there lightly — start
+a fresh `ThreadingHTTPServer` per test, `tearDown` `shutdown()` from the
+main thread (never from the `serve_forever` daemon) then `server_close()`.
+
+Invocation gotcha: `sidecar-2` has a hyphen, so it is not a valid Python
+identifier. `discover -s sidecar-2.tests` works from the repo root (parent
+of `sidecar-2/`). A single-module run `python -m unittest tests.test_handler`
+from inside `sidecar-2/` fails with `ModuleNotFoundError: No module named
+'sidecar-2'`; run `python -m unittest sidecar-2.tests.test_handler.<Case>`
+from the repo root instead.
+
 ### Relay invariants (`proxy.py`)
 
 `Handler._open_upstream_meta(path, command, body, headers) -> (conn, resp,
@@ -113,6 +129,18 @@ unified**:
 - **Fast path** buffers the full body into a local ``buf`` and salvages
   ``IncompleteRead.partial`` so a truncated lane can still win the race
   (biggest-partial rule). Do not unify the salvage into the single path.
+
+Gotcha: an exception raised in the single-path relay AFTER `send_response`
+set `_response_line_sent=True` (e.g. inside `_filter_response_headers`
+mid-relay) does NOT surface as a 502. The `except` at the top of `proxy()`
+guards `send_error(502)` with `if not self._response_line_sent`, so it is
+skipped and `finally` just closes the connection → the client sees
+`RemoteDisconnected` / `BadStatusLine`, never a 502. The bug this prevents:
+`resp.getheaders` (bound method, un-called) was once passed where a list of
+pairs was expected; iterating it raised `TypeError` just after the status
+line was sent, dropping the connection mid-response. If a 502 is genuinely
+desired for mid-relay failures, set `self._response_line_sent = False`
+before the failing step — but prefer fixing the relay so it doesn't raise.
 
 ``RoutingState.set_lane_pins`` is the only writer of a fast session's
 ``{"pin","pin2"?,"seen"}`` record after the lane split; ``assign_pin_pair``'s
@@ -145,3 +173,4 @@ logs `repin: null` even though it stays pinned.
 | `sidecar-2/sidecar.log` | Decision log (pooled only, gitignored) |
 | `sidecar-2/capture.jsonl` | Raw capture (pooled only, gitignored; **off by default — add `--capture`**) |
 | `sidecar-2/tests/test_routing.py` | Stdlib `unittest` for `build_send_order`/`fallback_feedback`/cooldowns/cold-start (see Verify) |
+| `sidecar-2/tests/test_handler.py` | Stdlib `unittest` end-to-end transport test: real `Sidecar` server vs in-process stub upstream (single-path + `/fast` relays); regression test for the `resp.getheaders` bug |

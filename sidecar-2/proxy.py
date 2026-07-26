@@ -101,10 +101,10 @@ class Handler(BaseHTTPRequestHandler):
         return out
 
     @staticmethod
-    def _filter_response_headers(getheaders) -> list[tuple[str, str]]:
+    def _filter_response_headers(headers) -> list[tuple[str, str]]:
         """Relay response headers except hop-by-hop and content-length."""
         out = []
-        for name, value in getheaders():
+        for name, value in headers:
             ln = name.lower()
             if ln in HOP_BY_HOP:
                 continue
@@ -293,7 +293,7 @@ class Handler(BaseHTTPRequestHandler):
             self._response_line_sent = True
 
             # 6. Relay response headers except hop-by-hop and content-length.
-            for name, value in self._filter_response_headers(resp.getheaders):
+            for name, value in self._filter_response_headers(resp.getheaders()):
                 self.send_header(name, value)
 
             # Pooled-only: expose sidecar routing decision to the client.
@@ -463,7 +463,7 @@ class Handler(BaseHTTPRequestHandler):
 
         self.send_response(winner["status"])
         for name, value in self._filter_response_headers(
-            lambda: winner["headers"]
+            winner["headers"]
         ):
             self.send_header(name, value)
         self.send_header("x-sidecar-session", session_key[:12])
