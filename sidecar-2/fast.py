@@ -21,6 +21,7 @@ from __future__ import annotations
 import copy
 
 from .identity import derive_session_key
+from .predicates import is_2xx
 from .state import RoutingState, pooled_gate, rewrite_body
 
 
@@ -53,11 +54,12 @@ def plan_fast_request(
         lane_a, lane_b, desperate = state.build_fast_lanes(
             providers, pin_a, pin_b, now
         )
-        state.pins[session_key] = {
-            "pin": providers.index(lane_a[0]),
-            "pin2": providers.index(lane_b[0]) if lane_b else None,
-            "seen": now,
-        }
+        state.set_lane_pins(
+            session_key,
+            providers.index(lane_a[0]),
+            providers.index(lane_b[0]) if lane_b else None,
+            now,
+        )
 
     def _lane_body(lane: list[str]) -> bytes:
         return rewrite_body(copy.deepcopy(parsed), pooled_model, lane)
@@ -95,7 +97,7 @@ def fast_lane_feedback(
       cool ``[1]``; served by ``5`` -> cool ``[1,3]``).
     * ``served`` outside the lane (unexpected) -> ``(served, [lane_keep[0]])``.
     """
-    if response_status is None or not (200 <= response_status < 300):
+    if not is_2xx(response_status):
         return None, []
     if not lane_keep or served is None or served == lane_keep[0]:
         return None, []
@@ -120,7 +122,7 @@ def is_complete(
     """
     if error is not None:
         return False
-    if status is None or not (200 <= status < 300):
+    if not is_2xx(status):
         return False
     if not is_stream:
         return True
@@ -148,9 +150,7 @@ def pick_winner(records: list[dict]) -> int:
     partial = [
         r
         for r in records
-        if r["status"] is not None
-        and 200 <= r["status"] < 300
-        and r["body"]
+        if is_2xx(r["status"]) and r["body"]
     ]
     if partial:
         return records.index(max(partial, key=lambda r: len(r["body"])))

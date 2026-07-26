@@ -99,6 +99,27 @@ cooldown regression, cold-start pin spread, `shuffle_pools`,
 `load_pools(reserve_bifrost=N)`, sanitize rewrites, and `extract_provider`
 against recorded SSE fixtures.
 
+### Relay invariants (`proxy.py`)
+
+`Handler._open_upstream_meta(path, command, body, headers) -> (conn, resp,
+status, resp_headers, is_stream)` is the shared open+request+getresponse+
+Content-Type/SSE-detection surface, called by both the single path
+(``_forward_and_relay``) and each fast lane (``_proxy_fast.run_lane``).
+The caller owns the response read loop and the two are **deliberately not
+unified**:
+- **Single path** relays incrementally (writes chunks to the client as they
+  arrive) and does NOT salvage ``IncompleteRead`` — a transport error there
+  must surface to the client, not a partial relay. Do not add salvage here.
+- **Fast path** buffers the full body into a local ``buf`` and salvages
+  ``IncompleteRead.partial`` so a truncated lane can still win the race
+  (biggest-partial rule). Do not unify the salvage into the single path.
+
+``RoutingState.set_lane_pins`` is the only writer of a fast session's
+``{"pin","pin2"?,"seen"}`` record after the lane split; ``assign_pin_pair``'s
+least-loaded ``pin_b`` can be swapped by ``build_fast_lanes``, so the record
+is re-pinned to the ACTUAL lane primaries. Do not write the record shape
+inline in ``fast.py`` — go through ``set_lane_pins``.
+
 ## sidecar.log record shape
 
 Emitted by `pooled.write_decision_log` in `sidecar-2/pooled.py` (Step 3 of

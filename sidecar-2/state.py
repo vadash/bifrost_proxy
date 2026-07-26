@@ -26,6 +26,7 @@ import threading
 
 from .config import SidecarConfig
 from .identity import derive_session_key
+from .predicates import is_2xx
 
 
 class RoutingState:
@@ -213,6 +214,23 @@ class RoutingState:
         self.pins[session_key] = record
         return pin_a, pin_b
 
+    def set_lane_pins(
+        self, session_key: str, lane_a_idx: int, lane_b_idx: int | None, now: float
+    ) -> None:
+        """Write the lane-primary pins for a fast two-lane session.
+
+        Replaces whatever ``assign_pin_pair`` stored: after the odd/even split +
+        pin_b swap in ``build_fast_lanes``, the actual lane primaries can differ
+        from the least-loaded pins ``assign_pin_pair`` chose, so the session must
+        be re-pinned to the lane primaries this request actually sent. ``lane_b_idx``
+        ``None`` (1-provider pool) omits ``pin2``, matching ``assign_pin_pair``'s
+        record shape. Must be called under ``self.lock()``.
+        """
+        record = {"pin": lane_a_idx, "seen": now}
+        if lane_b_idx is not None:
+            record["pin2"] = lane_b_idx
+        self.pins[session_key] = record
+
     def re_pin(
         self, session_key: str, provider: str, providers: list[str],
         now: float,
@@ -324,7 +342,7 @@ def fallback_feedback(
       ``keep_list[0]`` nor ``keep_list[1]``); else ``None`` (never cool a
       provider that served).
     """
-    if response_status is None or not (200 <= response_status < 300):
+    if not is_2xx(response_status):
         return None, None
     if not keep_list or served is None or served == keep_list[0]:
         return None, None

@@ -6,7 +6,8 @@ locality. Fixes Bifrost alpha-sort (every request starts `nvidia-1`, walks
 
 Status: **sidecar-2** (rebuild of v2.2). Session-pinned routing with global
 cooldown. Pure decision helpers live in `state.py`
-(`build_send_order`, `fallback_feedback`, `plan_pooled_request`); pooled
+(`build_send_order`, `fallback_feedback`, `plan_pooled_request`) and
+`predicates.py` (`is_2xx`, `is_sse_content_type`); pooled
 post-response concerns (feedback application + decision-log write) live in
 `pooled.py` (`apply_feedback`, plus `write_capture`/`write_decision_log`
 split out of the former `write_logs`); all are wired from the thin

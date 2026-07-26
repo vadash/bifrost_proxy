@@ -24,6 +24,7 @@ from .config import HOP_BY_HOP, SidecarConfig
 from .fast import is_complete, pick_winner, plan_fast_request
 from .io_jsonl import JsonlWriter, parse_request_body
 from .pooled import apply_fast_feedback, apply_feedback, write_capture, write_decision_log
+from .predicates import is_sse_content_type
 from .routing_info import extract_provider
 from .sanitize import model_needs_sanitize, sanitize_request_body
 from .state import RoutingState, plan_pooled_request
@@ -281,22 +282,15 @@ class Handler(BaseHTTPRequestHandler):
         served_provider)`` -- all ``None`` when an error escapes the caller's
         ``except`` block (status was never read).
         """
-        conn = self._open_upstream()
+        conn = None
         try:
-            conn.request(
-                self.command, upstream_path,
-                body=forward_body, headers=fwd_headers,
+            conn, resp, response_status, resp_headers, is_stream = self._open_upstream_meta(
+                upstream_path, self.command, forward_body, fwd_headers,
             )
-            resp = conn.getresponse()
 
-            # 4. Streaming detection.
-            ctype = resp.getheader("Content-Type", "")
-            is_stream = "text/event-stream" in ctype.lower()
-
-            # 5. Status line.
-            self.send_response(resp.status)
+            # 4. Status line.
+            self.send_response(response_status)
             self._response_line_sent = True
-            response_status = resp.status
 
             # 6. Relay response headers except hop-by-hop and content-length.
             for name, value in self._filter_response_headers(resp.getheaders):
@@ -370,16 +364,9 @@ class Handler(BaseHTTPRequestHandler):
             is_stream = None
             error = None
             try:
-                conn = self._open_upstream()
-                conn.request(
-                    self.command, upstream_path,
-                    body=lane_body, headers=fwd_headers,
+                conn, resp, status, resp_headers, is_stream = self._open_upstream_meta(
+                    upstream_path, self.command, lane_body, fwd_headers,
                 )
-                resp = conn.getresponse()
-                status = resp.status
-                resp_headers = list(resp.getheaders())
-                ctype = resp.getheader("Content-Type", "")
-                is_stream = "text/event-stream" in ctype.lower()
                 try:
                     if is_stream:
                         buf = bytearray()
@@ -498,3 +485,18 @@ class Handler(BaseHTTPRequestHandler):
         return http.client.HTTPConnection(
             cfg.upstream_host, cfg.upstream_port, timeout=cfg.upstream_timeout
         )
+
+    def _open_upstream_meta(self, path, command, body, headers):
+        """Open the upstream conn, send the request, return
+        ``(conn, resp, status, resp_headers, is_stream)``.
+
+        Shared by the single path (``_forward_and_relay``) and each fast lane
+        (``_proxy_fast.run_lane``). The caller owns the response read loop --
+        the single path relays incrementally, the fast path buffers fully --
+        so nothing about the read is shared here.
+        """
+        conn = self._open_upstream()
+        conn.request(command, path, body=body, headers=headers)
+        resp = conn.getresponse()
+        ctype = resp.getheader("Content-Type", "")
+        return conn, resp, resp.status, list(resp.getheaders()), is_sse_content_type(ctype)
