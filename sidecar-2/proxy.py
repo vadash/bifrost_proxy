@@ -14,13 +14,16 @@ non-pooled requests; the only change is *where* each concern lives.
 
 from __future__ import annotations
 
+import http.client
+import queue
+import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from .config import HOP_BY_HOP, SidecarConfig
 from .fast import is_complete, pick_winner, plan_fast_request
 from .io_jsonl import JsonlWriter, parse_request_body
-from .pooled import apply_fast_feedback, apply_feedback, write_logs
+from .pooled import apply_fast_feedback, apply_feedback, write_capture, write_decision_log
 from .routing_info import extract_provider
 from .sanitize import model_needs_sanitize, sanitize_request_body
 from .state import RoutingState, plan_pooled_request
@@ -111,12 +114,12 @@ class Handler(BaseHTTPRequestHandler):
 
     # --- Core forwarding logic -----------------------------------------------
     def proxy(self):
+        self._response_line_sent = False
         conn = None
         # `/fast/v1/...` races pooled models over two disjoint lanes; the
         # prefix is stripped and everything else flows through unchanged.
         fast_mode = self.path.startswith("/fast/")
         upstream_path = self.path[len("/fast"):] if fast_mode else self.path
-        response_line_sent = False
         response_status = None
         is_stream = None
         served_provider = None
@@ -145,7 +148,6 @@ class Handler(BaseHTTPRequestHandler):
             # 2. Build forward headers.
             fwd_headers = self._build_forward_headers()
 
-            cfg = self._cfg
             state = self._state
             forward_body = body  # default: verbatim passthrough
 
@@ -157,12 +159,9 @@ class Handler(BaseHTTPRequestHandler):
             #     the cap instead of defaulting to 8192
             # Re-serialize only when something actually changed, so clean
             # passthrough stays byte-verbatim.
-            if isinstance(request_body_parsed, dict) and model_needs_sanitize(
-                request_body_parsed.get("model")
-            ):
-                new = sanitize_request_body(request_body_parsed)
-                if new is not None:
-                    forward_body = new
+            new = self._sanitize_body(request_body_parsed)
+            if new is not None:
+                forward_body = new
 
             # --- 2b. Optional pooled routing: rewrite model+fallbacks,
             # pick pin, set state. Fast mode races two lanes instead. ---
@@ -188,52 +187,17 @@ class Handler(BaseHTTPRequestHandler):
                     desperate = plan["desperate"]
                     forward_body = plan["forward_body"]
 
-            # 3. Forward to upstream.
-            conn = self._open_upstream()
-            conn.request(self.command, upstream_path, body=forward_body, headers=fwd_headers)
-            resp = conn.getresponse()
+            # Pooled-only headers to expose to the client after the relay.
+            pooled_headers = (
+                {"session": session_key[:12], "pin": keep_list[0]}
+                if pooled_model is not None
+                else None
+            )
 
-            # 4. Streaming detection.
-            ctype = resp.getheader("Content-Type", "")
-            is_stream = "text/event-stream" in ctype.lower()
-
-            # 5. Status line.
-            self.send_response(resp.status)
-            response_line_sent = True
-            response_status = resp.status
-
-            # 6. Relay response headers except hop-by-hop and content-length.
-            for name, value in self._filter_response_headers(resp.getheaders):
-                self.send_header(name, value)
-
-            # Pooled-only: expose sidecar routing decision to the client.
-            if pooled_model is not None:
-                self.send_header("x-sidecar-session", session_key[:12])
-                self.send_header("x-sidecar-pin", keep_list[0])
-
-            sse_buf = bytearray()
-            if is_stream:
-                # Stream: Connection: close, relay chunks as they arrive.
-                self.send_header("Connection", "close")
-                self.end_headers()
-                while True:
-                    chunk = resp.read(cfg.chunk_size)
-                    if not chunk:
-                        break
-                    self.wfile.write(chunk)
-                    self.wfile.flush()
-                    sse_buf.extend(chunk)
-            else:
-                # Non-stream: buffer full body, send Content-Length.
-                resp_body = resp.read()
-                self.send_header("Content-Length", str(len(resp_body)))
-                self.send_header("Connection", "close")
-                self.end_headers()
-                self.wfile.write(resp_body)
-                served_provider = extract_provider(resp_body, is_stream=False)
-
-            if is_stream:
-                served_provider = extract_provider(bytes(sse_buf), is_stream=True)
+            # 3-6. Forward, detect stream, relay status/headers/body, extract provider.
+            response_status, is_stream, served_provider = self._forward_and_relay(
+                upstream_path, fwd_headers, forward_body, pooled_headers
+            )
 
             # --- 6b. Post-response feedback (pooled requests only). ---
             if pooled_model is not None:
@@ -252,7 +216,7 @@ class Handler(BaseHTTPRequestHandler):
 
         except Exception as e:
             error_str = repr(e)
-            if not response_line_sent:
+            if not self._response_line_sent:
                 try:
                     self.send_error(502, "sidecar upstream error")
                 except Exception:
@@ -268,14 +232,17 @@ class Handler(BaseHTTPRequestHandler):
             # Logging: pooled only. Non-pooled requests are transparent --
             # no capture.jsonl, no sidecar.log, no state, no headers.
             if pooled_model is not None:
-                write_logs(
-                    self._state,
-                    self._cfg,
-                    self._capture,
-                    self._log,
-                    self.headers,
-                    self.command,
-                    self.path,
+                write_capture(
+                    self._cfg, self._capture, self.headers,
+                    self.command, self.path,
+                    request_body_parsed=request_body_parsed,
+                    response_status=response_status,
+                    is_stream=is_stream,
+                    served_provider=served_provider,
+                    error_str=error_str,
+                )
+                write_decision_log(
+                    self._state, self._log,
                     session_key=session_key,
                     session_source=session_source,
                     pin=pin,
@@ -283,14 +250,94 @@ class Handler(BaseHTTPRequestHandler):
                     served_provider=served_provider,
                     repin=repin,
                     response_status=response_status,
-                    is_stream=is_stream,
-                    request_body_parsed=request_body_parsed,
                     desperate=desperate,
-                    error_str=error_str,
                 )
 
             # Force connection close; never let an exception escape.
             self.close_connection = True
+
+    def _sanitize_body(self, parsed) -> bytes | None:
+        """Return a re-serialized body when ``parsed`` is a Claude-family
+        request that needed fixing, else ``None`` (caller keeps verbatim)."""
+        if isinstance(parsed, dict) and model_needs_sanitize(parsed.get("model")):
+            return sanitize_request_body(parsed)
+        return None
+
+    def _forward_and_relay(
+        self,
+        upstream_path: str,
+        fwd_headers: dict[str, str],
+        forward_body: bytes,
+        pooled_headers: dict | None,
+    ) -> tuple[int | None, bool | None, str | None]:
+        """Forward to Bifrost and relay the response back to the client.
+
+        Steps 3-6 of the legacy ``proxy()``: open the upstream, send the
+        request, detect streaming, emit the status line + filtered headers
+        (plus the two ``x-sidecar-*`` headers from ``pooled_headers`` when
+        pooled), relay the body (stream chunks vs buffered
+        ``Content-Length``), then ``extract_provider`` on the buffered bytes
+        and close the connection. Returns ``(status, is_stream,
+        served_provider)`` -- all ``None`` when an error escapes the caller's
+        ``except`` block (status was never read).
+        """
+        conn = self._open_upstream()
+        try:
+            conn.request(
+                self.command, upstream_path,
+                body=forward_body, headers=fwd_headers,
+            )
+            resp = conn.getresponse()
+
+            # 4. Streaming detection.
+            ctype = resp.getheader("Content-Type", "")
+            is_stream = "text/event-stream" in ctype.lower()
+
+            # 5. Status line.
+            self.send_response(resp.status)
+            self._response_line_sent = True
+            response_status = resp.status
+
+            # 6. Relay response headers except hop-by-hop and content-length.
+            for name, value in self._filter_response_headers(resp.getheaders):
+                self.send_header(name, value)
+
+            # Pooled-only: expose sidecar routing decision to the client.
+            if pooled_headers is not None:
+                self.send_header("x-sidecar-session", pooled_headers["session"])
+                self.send_header("x-sidecar-pin", pooled_headers["pin"])
+
+            served_provider = None
+            sse_buf = bytearray()
+            if is_stream:
+                # Stream: Connection: close, relay chunks as they arrive.
+                self.send_header("Connection", "close")
+                self.end_headers()
+                while True:
+                    chunk = resp.read(self._cfg.chunk_size)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    self.wfile.flush()
+                    sse_buf.extend(chunk)
+            else:
+                # Non-stream: buffer full body, send Content-Length.
+                resp_body = resp.read()
+                self.send_header("Content-Length", str(len(resp_body)))
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.wfile.write(resp_body)
+                served_provider = extract_provider(resp_body, is_stream=False)
+
+            if is_stream:
+                served_provider = extract_provider(bytes(sse_buf), is_stream=True)
+
+            return response_status, is_stream, served_provider
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
     def _proxy_fast(self, plan, fwd_headers, upstream_path, request_body_parsed):
         """Race a pooled request over two disjoint lanes and relay the winner.
@@ -303,9 +350,6 @@ class Handler(BaseHTTPRequestHandler):
         second lane (needed for biggest-partial-wins). The loser keeps
         running as a daemon -- never cancelled, never joined.
         """
-        import http.client
-        import queue
-        import threading
 
         cfg = self._cfg
         state = self._state
@@ -378,14 +422,17 @@ class Handler(BaseHTTPRequestHandler):
                 response_status=status,
                 error_str=error,
             )
-            write_logs(
-                state,
-                cfg,
-                self._capture,
-                self._log,
-                self.headers,
-                self.command,
-                self.path,
+            write_capture(
+                cfg, self._capture, self.headers,
+                self.command, self.path,
+                request_body_parsed=request_body_parsed,
+                response_status=status,
+                is_stream=is_stream,
+                served_provider=served_provider,
+                error_str=error,
+            )
+            write_decision_log(
+                state, self._log,
                 session_key=session_key,
                 session_source=plan["session_source"],
                 pin=providers.index(lane_keep[0]),
@@ -393,10 +440,7 @@ class Handler(BaseHTTPRequestHandler):
                 served_provider=served_provider,
                 repin=repin,
                 response_status=status,
-                is_stream=is_stream,
-                request_body_parsed=request_body_parsed,
                 desperate=plan["desperate"],
-                error_str=error,
             )
             q.put({
                 "lane": lane,
@@ -450,7 +494,6 @@ class Handler(BaseHTTPRequestHandler):
         self.close_connection = True
 
     def _open_upstream(self):
-        import http.client
         cfg = self._cfg
         return http.client.HTTPConnection(
             cfg.upstream_host, cfg.upstream_port, timeout=cfg.upstream_timeout

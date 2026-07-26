@@ -8,7 +8,8 @@ Status: **sidecar-2** (rebuild of v2.2). Session-pinned routing with global
 cooldown. Pure decision helpers live in `state.py`
 (`build_send_order`, `fallback_feedback`, `plan_pooled_request`); pooled
 post-response concerns (feedback application + decision-log write) live in
-`pooled.py` (`apply_feedback`, `write_logs`); both are wired from the thin
+`pooled.py` (`apply_feedback`, plus `write_capture`/`write_decision_log`
+split out of the former `write_logs`); all are wired from the thin
 `proxy.py` HTTP-transport layer. Serving provider extracted from response
 bodies by `routing_info.py::extract_provider`. Pooled models declared in
 `sidecar-2/pools.json`. Non-pooled = verbatim passthrough, no logs (one

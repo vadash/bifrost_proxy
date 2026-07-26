@@ -19,10 +19,9 @@ single path:
 from __future__ import annotations
 
 import copy
-import json
 
 from .identity import derive_session_key
-from .state import RoutingState
+from .state import RoutingState, pooled_gate, rewrite_body
 
 
 def plan_fast_request(
@@ -42,13 +41,11 @@ def plan_fast_request(
     ``model = "{lane_primary}/{pooled}"`` and ``fallbacks`` for the rest of
     the lane (lanes are already <= 3, so the upstream cap holds).
     """
-    if not isinstance(parsed, dict):
+    gate = pooled_gate(state, parsed)
+    if gate is None:
         return None
-    pooled_model = parsed.get("model")
-    if not state.is_pooled(pooled_model):
-        return None
+    pooled_model, providers = gate
 
-    providers = state.pools[pooled_model]
     with state.lock():
         state.purge_expired(now)
         session_key, session_source = derive_session_key(parsed)
@@ -63,10 +60,7 @@ def plan_fast_request(
         }
 
     def _lane_body(lane: list[str]) -> bytes:
-        body = copy.deepcopy(parsed)
-        body["model"] = f"{lane[0]}/{pooled_model}"
-        body["fallbacks"] = [f"{p}/{pooled_model}" for p in lane[1:]]
-        return json.dumps(body).encode("utf-8")
+        return rewrite_body(copy.deepcopy(parsed), pooled_model, lane)
 
     return {
         "pooled_model": pooled_model,

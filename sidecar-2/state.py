@@ -334,6 +334,25 @@ def fallback_feedback(
     return served, cooldown_provider
 
 
+def pooled_gate(state: RoutingState, parsed) -> tuple[str, list[str]] | None:
+    """Return ``(pooled_model, providers)`` iff ``parsed`` is a dict whose
+    model is a declared pool key, else ``None`` (passthrough signal)."""
+    if not isinstance(parsed, dict):
+        return None
+    pooled_model = parsed.get("model")
+    if not state.is_pooled(pooled_model):
+        return None
+    return pooled_model, state.pools[pooled_model]
+
+
+def rewrite_body(body: dict, pooled_model: str, order: list[str]) -> bytes:
+    """Rewrite ``body`` IN PLACE: model -> ``{order[0]}/{pooled_model}``,
+    fallbacks -> next two providers. Returns the serialized bytes."""
+    body["model"] = f"{order[0]}/{pooled_model}"
+    body["fallbacks"] = [f"{p}/{pooled_model}" for p in order[1:3]]
+    return json.dumps(body).encode("utf-8")
+
+
 def plan_pooled_request(
     state: RoutingState, parsed: dict, now: float
 ) -> dict | None:
@@ -365,24 +384,19 @@ def plan_pooled_request(
     outside the lock — it's pure dict ops + ``json.dumps`` with no shared
     state, so holding the lock there would only serialise unrelated I/O.
     """
-    if not isinstance(parsed, dict):
+    gate = pooled_gate(state, parsed)
+    if gate is None:
         return None
-    pooled_model = parsed.get("model")
-    if not state.is_pooled(pooled_model):
-        return None
-
-    providers = state.pools[pooled_model]
+    pooled_model, providers = gate
     with state.lock():
         state.purge_expired(now)
         session_key, session_source = derive_session_key(parsed)
         pin = state.assign_pin(session_key, providers, now)
         keep_list, desperate = state.build_send_order(providers, pin, now)
 
-    parsed["model"] = f"{keep_list[0]}/{pooled_model}"
     # Send primary + 2 fallbacks only; full ring stays in keep_list for
     # pins/cooldowns (fallback_feedback still indexes keep_list[1]).
-    parsed["fallbacks"] = [f"{p}/{pooled_model}" for p in keep_list[1:3]]
-    forward_body = json.dumps(parsed).encode("utf-8")
+    forward_body = rewrite_body(parsed, pooled_model, keep_list)
 
     return {
         "pooled_model": pooled_model,

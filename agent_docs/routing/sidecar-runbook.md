@@ -39,6 +39,13 @@ With raw capture (records `sidecar-2/capture.jsonl`):
 python -m sidecar-2 --capture
 ```
 
+Gotcha: for pooled requests the captured `request_body` is the **rewritten**
+body (model → `{primary}/{pooled_model}` + 2 fallbacks), not the original —
+`state.plan_pooled_request` mutates `parsed` in place and `proxy.py` passes
+that same dict to `pooled.write_capture`. Non-pooled passthrough records the
+verbatim body. Deliberate carry-over from the proxy/pooled refactor; changing
+it is a behaviour change, not a bug.
+
 `start_sidecar.cmd` (repo-root launcher) deletes `sidecar-2/sidecar.log` before
 launch (rotation guard) and runs `python -m sidecar-2 --reserve-bifrost 3`
 (reserves first 3 alpha-sorted nvidia providers for the Bifrost auto route;
@@ -94,8 +101,9 @@ against recorded SSE fixtures.
 
 ## sidecar.log record shape
 
-Emitted by `pooled.write_logs` in `sidecar-2/pooled.py` (Step 3 of the
-proxy.py refactor lifted `Handler._write_logs` out to `pooled.py`): ts,
+Emitted by `pooled.write_decision_log` in `sidecar-2/pooled.py` (Step 3 of
+the proxy.py refactor split the former `write_logs` into `write_capture` +
+`write_decision_log`): ts,
 session, source, pin, primary, ring, cooldowns, served, fell_back, repin,
 status, desperate.
 `session` is the key truncated to 12 chars; `ring` is the kept send-order list
