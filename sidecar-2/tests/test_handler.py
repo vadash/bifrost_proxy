@@ -139,7 +139,7 @@ class TestHandlerRelay(unittest.TestCase):
         import shutil
         shutil.rmtree(self._tmp, ignore_errors=True)
 
-    def _post(self, path: str):
+    def _post(self, path: str, override: bytes | None = None):
         """One-shot POST through the sidecar.
 
         Returns ``(status, headers_dict_lowercased, body_bytes)``. A dropped
@@ -150,7 +150,7 @@ class TestHandlerRelay(unittest.TestCase):
         ``assertEqual(status, 200)`` fails cleanly instead of raising an
         unhandled ``RemoteDisconnected``. This is the regression signature.
         """
-        body = json.dumps({
+        body = override if override is not None else json.dumps({
             "model": "z-ai/glm-5.2",
             "prompt_cache_key": "sess-A",
             "messages": [{"role": "user", "content": "ping"}],
@@ -235,6 +235,36 @@ class TestHandlerRelay(unittest.TestCase):
         self.assertEqual(headers.get("x-sidecar-session"), "sess-A"[:12])
         self.assertEqual(body, _STUB_BODY)
 
+    def test_cap_max_tokens_reaches_upstream_pooled(self):
+        """The cap step mutates the parsed body in place *before* the pooled
+        rewrite serializes it, so the upstream sees ``max_tokens`` /
+        ``max_completion_tokens`` forced to the cap even when the client
+        sent neither field. Proves the cap propagates through the pooled path.
+        """
+        status, _, _ = self._post("/v1/chat/completions")
+        self.assertEqual(status, 200)
+        with self.stub._lock:
+            seen = self.stub.received_bodies[-1]
+        self.assertEqual(seen["max_tokens"], 16000)
+        self.assertEqual(seen["max_completion_tokens"], 16000)
+
+    def test_cap_max_tokens_clamps_oversize_passthrough(self):
+        """A non-pooled model with ``max_tokens=64000`` passes through the
+        cap step (unconditional, all models) and the upstream sees the
+        clamped value. Proves the cap works for passthrough (non-pooled)
+        requests and that an oversize budget is actually forced down.
+        """
+        payload = json.dumps({
+            "model": "nonexistent/model-x",  # not a pool key -> passthrough
+            "messages": [{"role": "user", "content": "ping"}],
+            "max_tokens": 64000,
+        }).encode("utf-8")
+        status, _, _ = self._post("/v1/chat/completions", override=payload)
+        self.assertEqual(status, 200)
+        with self.stub._lock:
+            seen = self.stub.received_bodies[-1]
+        self.assertEqual(seen["max_tokens"], 16000)
+        self.assertEqual(seen["max_completion_tokens"], 16000)
 
 
 

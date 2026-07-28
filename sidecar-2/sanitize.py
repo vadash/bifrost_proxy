@@ -23,9 +23,13 @@ sonnet / opus, case-insensitive):
    (``stop_reason: max_tokens`` at exactly 8192 output tokens).
    ``mirror_max_tokens`` copies the value under the Bedrock-native name.
 
-All three are deterministic, in-place (mutating the parsed dict matches the
-proxy's pooled-rewrite pattern), and only act when a rewrite is actually
-needed.
+``cap_max_tokens`` runs unconditionally (every request, every model): when
+``max_tokens`` (Anthropic) or ``max_completion_tokens`` (OpenAI) is missing or
+exceeds ``_MAX_TOKENS_CAP`` both fields are forced to the cap so every upstream
+variation reads the same budget. The three fixes below are then gated on a
+Claude-family model name. All rewriters are deterministic and in-place
+(mutating the parsed dict matches the proxy's pooled-rewrite pattern), and
+only act when a rewrite is actually needed.
 """
 
 from __future__ import annotations
@@ -34,6 +38,10 @@ import json
 
 # Lowercase substrings matched against the request's model name.
 _CLAUDE_MODEL_HINTS: tuple[str, ...] = ("claude", "sonnet", "opus")
+
+# Hard ceiling applied to max_tokens / max_completion_tokens for every
+# request regardless of model or upstream provider (see ``cap_max_tokens``).
+_MAX_TOKENS_CAP: int = 16000
 
 
 def model_needs_sanitize(model: object) -> bool:
@@ -151,6 +159,39 @@ def mirror_max_tokens(body: dict) -> bool:
         return False
     body["max_tokens"] = mct
     return True
+
+
+def cap_max_tokens(body: dict) -> bool:
+    """Cap ``max_tokens`` / ``max_completion_tokens`` to a fixed ceiling.
+
+    Some providers reject or silently truncate very large output budgets, and
+    missing budgets fall back to provider defaults that can be far below what
+    the client needs. To keep behavior uniform across all models and
+    providers, any of ``max_tokens`` (Anthropic) or ``max_completion_tokens``
+    (OpenAI) that is missing or greater than ``_MAX_TOKENS_CAP`` is forced to
+    the cap; both fields are then set to the same (capped) value so every
+    upstream variation reads the real budget.
+
+    Runs unconditionally (not gated on a Claude-family model) and runs *before*
+    the Claude-only ``mirror_max_tokens`` — so a capped ``max_tokens`` is
+    already present and mirroring becomes a no-op, which is exactly the
+    desired end state.
+
+    Non-dict inputs (raw non-JSON bodies) are a no-op and return False.
+
+    Returns True when the body was modified (caller re-serializes).
+    """
+    if not isinstance(body, dict):
+        return False
+    changed = False
+    for field in ("max_tokens", "max_completion_tokens"):
+        current = body.get(field)
+        if not isinstance(current, int) or isinstance(current, bool) or current > _MAX_TOKENS_CAP:
+            if current != _MAX_TOKENS_CAP:
+                body[field] = _MAX_TOKENS_CAP
+                changed = True
+        # Below-cap explicit values are left untouched.
+    return changed
 
 
 def sanitize_request_body(parsed: dict) -> bytes | None:

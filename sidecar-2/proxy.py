@@ -14,6 +14,7 @@ non-pooled requests; the only change is *where* each concern lives.
 
 from __future__ import annotations
 
+import json
 import http.client
 import queue
 import threading
@@ -26,7 +27,7 @@ from .io_jsonl import JsonlWriter, parse_request_body
 from .pooled import apply_fast_feedback, apply_feedback, write_capture, write_decision_log
 from .predicates import is_sse_content_type
 from .routing_info import extract_provider
-from .sanitize import model_needs_sanitize, sanitize_request_body
+from .sanitize import cap_max_tokens, model_needs_sanitize, sanitize_request_body
 from .state import RoutingState, plan_pooled_request
 
 
@@ -152,12 +153,13 @@ class Handler(BaseHTTPRequestHandler):
             state = self._state
             forward_body = body  # default: verbatim passthrough
 
-            # 2a. Claude-family fixes (pooled AND passthrough):
-            #   - strip empty thinking blocks ("thinking: Field required" 400)
-            #   - rewrite OpenAI reasoning_effort -> Bedrock thinking.adaptive
-            #     + output_config.effort ("thinking.enabled is not supported" 400)
-            #   - mirror max_completion_tokens -> max_tokens so Bedrock honors
-            #     the cap instead of defaulting to 8192
+            # 2a. Request-body fixes (pooled AND passthrough):
+            #   - cap max_tokens / max_completion_tokens at the hard ceiling
+            #     for *every* request (missing or oversize -> 16000), all
+            #     models and upstream providers
+            #   - Claude-only: strip empty thinking blocks, rewrite OpenAI
+            #     reasoning_effort -> Bedrock thinking.adaptive + output_config,
+            #     mirror max_completion_tokens -> max_tokens
             # Re-serialize only when something actually changed, so clean
             # passthrough stays byte-verbatim.
             new = self._sanitize_body(request_body_parsed)
@@ -258,11 +260,28 @@ class Handler(BaseHTTPRequestHandler):
             self.close_connection = True
 
     def _sanitize_body(self, parsed) -> bytes | None:
-        """Return a re-serialized body when ``parsed`` is a Claude-family
-        request that needed fixing, else ``None`` (caller keeps verbatim)."""
-        if isinstance(parsed, dict) and model_needs_sanitize(parsed.get("model")):
-            return sanitize_request_body(parsed)
-        return None
+        """Return a re-serialized body when ``parsed`` needed fixing, else
+        ``None`` (caller keeps the original verbatim bytes).
+
+        Two stages, the first unconditional and the second Claude-gated:
+
+        1. ``cap_max_tokens`` forces ``max_tokens`` / ``max_completion_tokens``
+           to the hard ceiling for *every* request (all models, all upstream
+           providers) when the value is missing or exceeds the cap.
+        2. ``sanitize_request_body`` applies the Claude-only thinking /
+           reasoning_effort / max_tokens-mirror rewrites.
+
+        Because both rewriters mutate ``parsed`` in place, a single full
+        re-serialize at the end carries every changed field downstream.
+        """
+        if not isinstance(parsed, dict):
+            return None
+        changed = cap_max_tokens(parsed)
+        if model_needs_sanitize(parsed.get("model")):
+            changed = sanitize_request_body(parsed) is not None or changed
+        if not changed:
+            return None
+        return json.dumps(parsed).encode("utf-8")
 
     def _forward_and_relay(
         self,

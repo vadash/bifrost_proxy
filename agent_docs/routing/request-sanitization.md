@@ -1,8 +1,33 @@
-# Request Sanitization (Claude-family fixes)
+# Request Sanitization
 
-The sidecar rewrites Claude-family request bodies in three independent cases
-beyond pooled routing, all gated on a `claude`/`sonnet`/`opus` model name
-and applied to **pooled and passthrough requests alike**.
+The sidecar rewrites request bodies beyond pooled routing. One fix runs
+**unconditionally for every request** (all models, all providers); three
+further fixes are gated on a `claude`/`sonnet`/`opus` model name and apply to
+pooled and passthrough requests alike.
+
+## Fix 0 — `max_tokens` / `max_completion_tokens` cap (unconditional)
+
+### The failure
+
+Some providers reject or silently truncate very large output budgets, and a
+missing budget falls back to a provider default that can be far below what
+the client needs. To keep behavior uniform, every request gets its output
+token budget clamped to a hard ceiling.
+
+### The fix
+
+`cap_max_tokens(body)` runs for **every** request regardless of model or
+upstream provider, in place:
+
+- For each of `max_tokens` (Anthropic) and `max_completion_tokens` (OpenAI):
+  if the field is missing, non-int, or greater than `_MAX_TOKENS_CAP` (16000),
+  it is set to `16000`. Below-cap explicit values are left untouched.
+- Both fields are always set to a (possibly equal) value after the cap runs,
+  so every upstream variation reads the real budget.
+- The cap runs *before* Fix 3 (`mirror_max_tokens`); a capped `max_tokens` is
+  therefore already present, making the mirror a no-op — the desired end state.
+
+Returns `True` when the body was modified.
 
 ## Fix 1 — empty `thinking` blocks
 
@@ -87,17 +112,21 @@ Returns `True` when the body was modified.
 
 ## Wiring — `sidecar-2/sanitize.py` -> `proxy.py` step 2a
 
-All three fixes run at `proxy.py` step **2a**, before pooled routing (2b):
+The fixes run at `proxy.py` step **2a**, before pooled routing (2b), inside
+the handler's `_sanitize_body(parsed)`:
 
-- Gate: `model_needs_sanitize(model)` — model name contains `claude`,
-  `sonnet`, or `opus` (case-insensitive). Non-Claude models and non-string
-  model fields are never touched.
-- `sanitize_request_body(parsed)` (`sanitize.py`) runs all three rewrites,
-  ORs their "changed" flags, and **re-serializes only when something actually
+- **Fix 0 (`cap_max_tokens`)** runs unconditionally for every parsed dict
+  request — no model gate. It mutates `parsed` in place; since both the
+  passthrough and the pooled/fast body rewrites serialize from `parsed`, the
+  cap propagates to every path.
+- **Fixes 1–3** run only when `model_needs_sanitize(model)` is true (model
+  name contains `claude`, `sonnet`, or `opus`, case-insensitive). The gate
+  sees the **original** client model name, before pooled routing rewrites it
+  to `provider/pool` form.
+- `_sanitize_body` ORs the "changed" flags from the cap and
+  `sanitize_request_body` and **re-serializes only when something actually
   changed** (returns the new `bytes`, or `None` to leave clean passthrough
-  byte-verbatim). `proxy.py` just calls it under the gate at step 2a.
-- The gate looks at the **original** model name from the client, before
-  pooled routing rewrites it to `provider/pool` form.
+  byte-verbatim).
 
 ## Gotchas
 

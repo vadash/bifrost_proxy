@@ -16,6 +16,7 @@ import unittest
 # ``sidecar-2`` is not a valid ``import`` statement identifier (hyphen), so
 # load the module via importlib.
 _sanitize = importlib.import_module("sidecar-2.sanitize")
+cap_max_tokens = _sanitize.cap_max_tokens
 mirror_max_tokens = _sanitize.mirror_max_tokens
 model_needs_sanitize = _sanitize.model_needs_sanitize
 rewrite_reasoning_effort = _sanitize.rewrite_reasoning_effort
@@ -280,6 +281,73 @@ class TestInjectBedrockMaxTokens(unittest.TestCase):
             with self.subTest(value=bad):
                 self.assertFalse(mirror_max_tokens(body))
                 self.assertNotIn("max_tokens", body)
+
+
+class TestCapMaxTokens(unittest.TestCase):
+    """``cap_max_tokens`` — unconditional ceiling on the output-token budget.
+
+    Both ``max_tokens`` (Anthropic) and ``max_completion_tokens`` (OpenAI) are
+    forced to ``_MAX_TOKENS_CAP`` whenever the value is missing or exceeds the
+    cap. Applies to every request regardless of model/provider.
+    """
+
+    def test_sets_both_when_missing(self):
+        body = {"model": "gpt-5", "messages": []}
+        self.assertTrue(cap_max_tokens(body))
+        self.assertEqual(body["max_tokens"], 16000)
+        self.assertEqual(body["max_completion_tokens"], 16000)
+
+    def test_clamps_oversize_to_cap(self):
+        # The pathological case: client asked for 64000 output tokens.
+        body = {"model": "claude-opus-4-8", "max_tokens": 64000}
+        self.assertTrue(cap_max_tokens(body))
+        self.assertEqual(body["max_tokens"], 16000)
+        # Missing OpenAI field is also filled to the cap.
+        self.assertEqual(body["max_completion_tokens"], 16000)
+
+    def test_clamps_openai_oversize_only(self):
+        body = {"model": "gpt-5", "max_completion_tokens": 100000}
+        self.assertTrue(cap_max_tokens(body))
+        self.assertEqual(body["max_completion_tokens"], 16000)
+        # Missing Anthropic field filled to cap.
+        self.assertEqual(body["max_tokens"], 16000)
+
+    def test_preserves_below_cap_values(self):
+        body = {"max_tokens": 4096, "max_completion_tokens": 8192}
+        before = copy.deepcopy(body)
+        self.assertFalse(cap_max_tokens(body))
+        self.assertEqual(body, before)
+
+    def test_preserves_one_below_one_missing(self):
+        # An explicit below-cap value stays; only the missing field is filled.
+        body = {"max_tokens": 4096}
+        self.assertTrue(cap_max_tokens(body))
+        self.assertEqual(body["max_tokens"], 4096)
+        self.assertEqual(body["max_completion_tokens"], 16000)
+
+    def test_clamps_above_cap_keeps_field_below_cap(self):
+        body = {"max_tokens": 64000, "max_completion_tokens": 4096}
+        self.assertTrue(cap_max_tokens(body))
+        self.assertEqual(body["max_tokens"], 16000)
+        self.assertEqual(body["max_completion_tokens"], 4096)
+
+    def test_non_int_values_treated_as_missing(self):
+        for bad in (None, "16000", 16000.0, True):
+            body = {"max_tokens": bad, "model": "glm-5.2"}
+            with self.subTest(value=bad):
+                self.assertTrue(cap_max_tokens(body))
+                self.assertEqual(body["max_tokens"], 16000)
+                self.assertEqual(body["max_completion_tokens"], 16000)
+
+    def test_exactly_at_cap_is_left_untouched(self):
+        body = {"max_tokens": 16000, "max_completion_tokens": 16000}
+        before = copy.deepcopy(body)
+        self.assertFalse(cap_max_tokens(body))
+        self.assertEqual(body, before)
+
+    def test_not_a_dict_is_noop(self):
+        for bad in (None, "raw-body", 42, [], b"x"):
+            self.assertFalse(cap_max_tokens(bad))
 
 
 class TestSanitizeRequestBody(unittest.TestCase):
