@@ -15,5 +15,43 @@
         "nvidia-13",
         "nvidia-14",
         "nvidia-15"
-    ]
+    ],
+    "thinkingmachines/inkling": [
+        "nvidia-1",
+        "nvidia-2",
+        "nvidia-3",
+        "nvidia-4",
+        "nvidia-5",
+        "nvidia-6",
+        "nvidia-7",
+        "nvidia-8",
+        "nvidia-9",
+        "nvidia-10",
+        "nvidia-11",
+        "nvidia-12",
+        "nvidia-13",
+        "nvidia-14",
+        "nvidia-15"
+    ],
+    "poolside/laguna-xs-2.1": [
+        "nvidia-1",
+        "nvidia-2",
+        "nvidia-3",
+        "nvidia-4",
+        "nvidia-5",
+        "nvidia-6",
+        "nvidia-7",
+        "nvidia-8",
+        "nvidia-9",
+        "nvidia-10",
+        "nvidia-11",
+        "nvidia-12",
+        "nvidia-13",
+        "nvidia-14",
+        "nvidia-15"
+    ],
+    "kilo-auto/free": [
+        "kilo-01",
+        "kilo-02"
+    ]    
 }
