@@ -40,3 +40,10 @@ fallback) — see **[fast-race-endpoint.md](fast-race-endpoint.md)**.
    claude/sonnet/opus models.
 6. **[fast-race-endpoint.md](fast-race-endpoint.md)** — `/fast/v1` two-lane
    race: lane construction, dual pins, winner selection, per-lane feedback.
+7. CORS: when started with `--cors` (Tailscale/tailnet bind),
+   `proxy.py::_send_cors_headers` emits permissive
+   `Access-Control-Allow-Origin: *` and answers OPTIONS preflight directly.
+   The sidecar is the authoritative CORS source on the tailnet, so
+   `_filter_response_headers` strips any upstream `Access-Control-*` headers
+   Bifrost relays — otherwise the browser sees a duplicate allow-origin
+   (`*, https://vadash.github.io`) and blocks the call.

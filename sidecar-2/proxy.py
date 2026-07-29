@@ -140,15 +140,24 @@ class Handler(BaseHTTPRequestHandler):
             out[name] = value  # preserve Authorization verbatim upstream
         return out
 
-    @staticmethod
-    def _filter_response_headers(headers) -> list[tuple[str, str]]:
-        """Relay response headers except hop-by-hop and content-length."""
+    def _filter_response_headers(self, headers) -> list[tuple[str, str]]:
+        """Relay response headers except hop-by-hop and content-length.
+
+        When the sidecar owns CORS (``--cors``), also drop any CORS headers
+        the upstream Bifrost/proxy emitted. Otherwise both the sidecar's own
+        ``Access-Control-Allow-Origin: *`` and the upstream's origin-specific
+        value reach the browser as a duplicate header, which browsers reject
+        ("header contains multiple values"). The sidecar is the authoritative
+        CORS source on the tailnet bind, so upstream CORS is stripped.
+        """
         out = []
         for name, value in headers:
             ln = name.lower()
             if ln in HOP_BY_HOP:
                 continue
             if ln == "content-length":
+                continue
+            if self._cors and ln.startswith("access-control-"):
                 continue
             out.append((name, value))
         return out

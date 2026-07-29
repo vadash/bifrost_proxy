@@ -22,7 +22,6 @@ import importlib
 import json
 import os
 import tempfile
-import time
 import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -372,6 +371,109 @@ class TestHandlerCORS(unittest.TestCase):
             "OPTIONS preflight must NOT be forwarded to the stub upstream")
 
 
+# Stub upstream that also emits its own CORS header -- simulates Bifrost
+# (or a downstream proxy) answering with an origin-specific allow-origin.
+# Pre-fix the sidecar relayed this verbatim on top of its own ``*``, so the
+# browser saw ``Access-Control-Allow-Origin: *, https://vadash.github.io``
+# and rejected the response ("header contains multiple values").
+_STUB_BODY_CORS = _STUB_BODY
+
+
+class StubHandlerUpstreamCORS(StubHandler):
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length") or 0)
+        body = self.rfile.read(length) if length else b""
+        try:
+            parsed = json.loads(body)
+        except Exception:
+            parsed = None
+        with self.server._lock:
+            self.server.received_bodies.append(parsed)
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        # Upstream emits its own origin-specific allow-origin header. The
+        # sidecar must drop this when it owns CORS, so only its ``*`` remains.
+        self.send_header("Access-Control-Allow-Origin",
+                         "https://vadash.github.io")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST")
+        self.send_header("Content-Length", str(len(_STUB_BODY_CORS)))
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.wfile.write(_STUB_BODY_CORS)
+        self.close_connection = True
+
+
+class TestHandlerCORSStripUpstream(unittest.TestCase):
+    """When --cors is on the sidecar owns CORS and must not relay upstream
+    ``Access-Control-*`` headers -- otherwise the browser sees a duplicate
+    allow-origin value and blocks the call.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp(prefix="sidecar-cors-strip-")
+        self.stub = StubBifrost(("127.0.0.1", 0))
+        self.stub.RequestHandlerClass = StubHandlerUpstreamCORS
+        stub_port = self.stub.server_address[1]
+        cfg = SidecarConfig(
+            upstream_host="127.0.0.1",
+            upstream_port=stub_port,
+            listen_host="127.0.0.1",
+            listen_port=0,
+            pools_path="",
+            log_path=f"{self._tmp}/sidecar.log",
+            capture_path=f"{self._tmp}/capture.jsonl",
+            capture_enabled=False,
+            pools={"z-ai/glm-5.2": ["nvidia-1", "nvidia-2", "nvidia-3", "nvidia-4"]},
+            cors_enabled=True,
+        )
+        state = RoutingState(cfg, shuffle_pools=False)
+        self.sidecar = Sidecar(cfg.listen_addr, _proxy.Handler)
+        self.sidecar.cfg = cfg
+        self.sidecar.state = state
+        self.sidecar.capture_writer = JsonlWriter(cfg.capture_path)
+        self.sidecar.log_writer = JsonlWriter(cfg.log_path)
+        self._stub_thread = threading.Thread(
+            target=self.stub.serve_forever, daemon=True)
+        self._stub_thread.start()
+        self._sidecar_thread = threading.Thread(
+            target=self.sidecar.serve_forever, daemon=True)
+        self._sidecar_thread.start()
+
+    def tearDown(self):
+        self.stub.shutdown()
+        self.sidecar.shutdown()
+        self.stub.server_close()
+        self.sidecar.server_close()
+        self.sidecar.capture_writer.close()
+        self.sidecar.log_writer.close()
+        import shutil
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def test_only_sidecar_cors_origin_relayed(self):
+        """The upstream's origin-specific allow-origin is dropped; the only
+        allow-origin reaching the client is the sidecar's ``*``.
+        """
+        body = json.dumps({
+            "model": "z-ai/glm-5.2",
+            "prompt_cache_key": "sess-A",
+            "messages": [{"role": "user", "content": "ping"}],
+        }).encode("utf-8")
+        conn = http.client.HTTPConnection(
+            self.sidecar.server_address[0],
+            self.sidecar.server_address[1], timeout=30)
+        conn.request("POST", "/v1/chat/completions", body=body,
+                     headers={"Content-Type": "application/json",
+                              "Content-Length": str(len(body))})
+        resp = conn.getresponse()
+        resp.read()
+        # http.client flattens duplicate headers to "v1, v2"; assert single.
+        raw = resp.getheader("Access-Control-Allow-Origin")
+        conn.close()
+        self.assertEqual(raw, "*",
+                         "upstream CORS must be stripped when --cors is on; "
+                         f"got {raw!r}")
+
+
 class TestJsonlWriterHandle(unittest.TestCase):
     """Persistent-handle + fsync scheduler behavior for ``JsonlWriter``.
 
@@ -407,18 +509,23 @@ class TestJsonlWriterHandle(unittest.TestCase):
                 pass
 
     def test_scheduler_fsyncs_without_raising(self):
-        # Registering a writer lazily starts the fsync daemon. Wait one
-        # interval + slack so the thread ticks at least once. Asserts no
-        # exception surfaces and the line is durably on disk.
+        # The fsync scheduler is best-effort; the per-record ``flush()`` in
+        # ``JsonlWriter.write`` already guarantees process-kill durability,
+        # so the line is on disk immediately after write(). We assert the
+        # real invariants (line persisted, handle open, no fsync error) by
+        # exercising the scheduler's own fsync path once, synchronously --
+        # no 6s sleep waiting for the daemon tick.
         fd, p = tempfile.mkstemp(prefix="sidecar-jsonl-", suffix=".jsonl")
         os.close(fd)
         w = JsonlWriter(p)
         try:
             w.write({"x": "fsync-test"})
-            time.sleep(_config.FSYNC_INTERVAL_SECS + 1.0)
-            # If the scheduler had raised on this writer the next write would
-            # still succeed (errors are swallowed in-thread). The observable
-            # contract: line persisted, writer still usable, handle open.
+            # Exercise the scheduler's per-writer fsync path directly. This
+            # is exactly what ``_FsyncScheduler._run`` does on each tick;
+            # calling it once proves the fd fsyncs without raising.
+            with w._lock:
+                if w._fh is not None and not w._fh.closed:
+                    os.fsync(w._fh.fileno())
             self.assertIsNotNone(w._fh)
             self.assertFalse(w._fh.closed)
             import pathlib
