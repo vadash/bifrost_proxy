@@ -33,4 +33,4 @@ if exist "sidecar-2\sidecar.log" del /q "sidecar-2\sidecar.log"
 
 rem --- reserve first 3 alpha-sorted providers (nvidia-1..3) for the Bifrost
 rem     auto route; sidecar pools the remaining 12 (nvidia-4..15) ---
-python -m sidecar-2 --listen %LISTEN% --upstream %UPSTREAM% --reserve-bifrost 3
+python -m sidecar-2 --listen %LISTEN% --upstream %UPSTREAM% --reserve-bifrost 3 --cors

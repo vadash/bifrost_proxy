@@ -64,12 +64,49 @@ class Handler(BaseHTTPRequestHandler):
     def do_PUT(self): self.proxy()
     def do_DELETE(self): self.proxy()
     def do_PATCH(self): self.proxy()
-    def do_OPTIONS(self): self.proxy()
+    def do_OPTIONS(self): self._handle_preflight()
     def do_HEAD(self): self.proxy()
 
     # Silence default stderr logging (we do our own capture).
     def log_message(self, *a):
         pass
+
+    @property
+    def _cors(self) -> bool:
+        return self.server.cfg.cors_enabled
+
+    def _send_cors_headers(self):
+        """Emit permissive CORS headers on the outgoing response.
+
+        Only called when ``cfg.cors_enabled`` is set (the Tailscale/tailnet
+        path, where the network is already WireGuard-authenticated). ``*`` is
+        correct here: credentials are not used cross-origin, and the tailnet
+        is the trust boundary.
+        """
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods",
+                         "GET, POST, PUT, DELETE, PATCH, OPTIONS, HEAD")
+        self.send_header("Access-Control-Allow-Headers", "*")
+        self.send_header("Access-Control-Max-Age", "86400")
+
+    def _handle_preflight(self):
+        """Answer an OPTIONS preflight directly without forwarding upstream.
+
+        Browsers send OPTIONS before cross-origin writes (POST/PUT/etc.).
+        Forwarding it to Bifrost is pointless (Bifrost won't have CORS
+        answers) and the preflight must return 2xx for the browser to proceed.
+        When CORS is off, fall through to the normal proxy so behavior is
+        unchanged for non-browser clients.
+        """
+        if not self._cors or not self.headers.get("Origin"):
+            self.proxy()
+            return
+        self.send_response(204)
+        self._send_cors_headers()
+        self.send_header("Content-Length", "0")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.close_connection = True
 
     # --- Convenience accessors for the injected collaborators -----------------
     @property
@@ -319,6 +356,10 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(response_status)
             self._response_line_sent = True
 
+            # Permissive CORS when enabled (Tailscale/tailnet bind).
+            if self._cors:
+                self._send_cors_headers()
+
             # 6. Relay response headers except hop-by-hop and content-length.
             for name, value in self._filter_response_headers(resp.getheaders()):
                 self.send_header(name, value)
@@ -484,11 +525,21 @@ class Handler(BaseHTTPRequestHandler):
             winner = ordered[pick_winner(ordered)]
 
         if winner["status"] is None:
-            self.send_error(502, "sidecar upstream error")
+            body = b'{"error":"sidecar upstream error"}'
+            self.send_response(502)
+            if self._cors:
+                self._send_cors_headers()
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(body)
             self.close_connection = True
             return
 
         self.send_response(winner["status"])
+        if self._cors:
+            self._send_cors_headers()
         for name, value in self._filter_response_headers(
             winner["headers"]
         ):

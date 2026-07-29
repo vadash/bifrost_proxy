@@ -81,6 +81,14 @@ def _build_argparser() -> argparse.ArgumentParser:
             "route on each pool (excluded from sidecar pooling; default: 0)"
         ),
     )
+    p.add_argument(
+        "--cors", action="store_true", default=False,
+        help=(
+            "emit permissive CORS headers (Access-Control-Allow-Origin: *) "
+            "and answer OPTIONS preflight directly. Intended for browser "
+            "clients over a Tailscale/tailnet bind. OFF by default."
+        ),
+    )
     return p
 
 
@@ -130,6 +138,7 @@ def main(argv: list[str] | None = None) -> int:
         upstream_timeout=args.upstream_timeout,
         pools=pools,
         reserve_bifrost=args.reserve_bifrost,
+        cors_enabled=args.cors,
     )
 
     state = RoutingState(cfg)

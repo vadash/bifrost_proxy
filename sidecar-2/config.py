@@ -55,6 +55,7 @@ class SidecarConfig:
     log_path: str = os.path.join(_DIRNAME, "sidecar.log")
     capture_path: str = os.path.join(_DIRNAME, "capture.jsonl")
     capture_enabled: bool = False
+    cors_enabled: bool = False  # emit permissive CORS headers (Tailscale/tailnet use)
 
     session_ttl: float = 3600.0   # inactivity TTL for pins / resp-id map (s)
     default_cooldown: float = 600.0  # provider cooldown duration (s)

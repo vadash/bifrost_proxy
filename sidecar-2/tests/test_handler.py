@@ -268,6 +268,110 @@ class TestHandlerRelay(unittest.TestCase):
 
 
 
+class TestHandlerCORS(unittest.TestCase):
+    """CORS emission (--cors path): permissive headers on responses and a
+    204 short-circuit for OPTIONS preflight (no upstream forward).
+
+    Mirrors ``TestHandlerRelay.setUp`` but builds the ``Sidecar`` with
+    ``cors_enabled=True`` -- the config ``start_sidecar.cmd`` now launches
+    with on the Tailscale bind. The same stub upstream is reused so we can
+    prove a real POST carries CORS headers and an OPTIONS preflight does
+    NOT reach the stub.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp(prefix="sidecar-cors-")
+        self.stub = StubBifrost(("127.0.0.1", 0))
+        stub_port = self.stub.server_address[1]
+        cfg = SidecarConfig(
+            upstream_host="127.0.0.1",
+            upstream_port=stub_port,
+            listen_host="127.0.0.1",
+            listen_port=0,
+            pools_path="",
+            log_path=f"{self._tmp}/sidecar.log",
+            capture_path=f"{self._tmp}/capture.jsonl",
+            capture_enabled=False,
+            pools={"z-ai/glm-5.2": ["nvidia-1", "nvidia-2", "nvidia-3", "nvidia-4"]},
+            cors_enabled=True,
+        )
+        state = RoutingState(cfg, shuffle_pools=False)
+        self.sidecar = Sidecar(cfg.listen_addr, _proxy.Handler)
+        self.sidecar.cfg = cfg
+        self.sidecar.state = state
+        self.sidecar.capture_writer = JsonlWriter(cfg.capture_path)
+        self.sidecar.log_writer = JsonlWriter(cfg.log_path)
+        self._stub_thread = threading.Thread(
+            target=self.stub.serve_forever, daemon=True)
+        self._stub_thread.start()
+        self._sidecar_thread = threading.Thread(
+            target=self.sidecar.serve_forever, daemon=True)
+        self._sidecar_thread.start()
+
+    def tearDown(self):
+        self.stub.shutdown()
+        self.sidecar.shutdown()
+        self.stub.server_close()
+        self.sidecar.server_close()
+        self.sidecar.capture_writer.close()
+        self.sidecar.log_writer.close()
+        import shutil
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def _post(self, path):
+        body = json.dumps({
+            "model": "z-ai/glm-5.2",
+            "prompt_cache_key": "sess-A",
+            "messages": [{"role": "user", "content": "ping"}],
+        }).encode("utf-8")
+        conn = http.client.HTTPConnection(
+            self.sidecar.server_address[0],
+            self.sidecar.server_address[1], timeout=30)
+        conn.request("POST", path, body=body,
+                     headers={"Content-Type": "application/json",
+                              "Content-Length": str(len(body))})
+        resp = conn.getresponse()
+        status = resp.status
+        headers = {k.lower(): v for k, v in resp.getheaders()}
+        body = resp.read()
+        conn.close()
+        return status, headers, body
+
+    def test_post_carries_permissive_cors_headers(self):
+        """A real pooled POST response carries
+        ``Access-Control-Allow-Origin: *`` so browsers on the tailnet stop
+        blocking the cross-origin call to the sidecar's Tailscale IP.
+        """
+        status, headers, _ = self._post("/v1/chat/completions")
+        self.assertEqual(status, 200)
+        self.assertEqual(headers.get("access-control-allow-origin"), "*")
+        self.assertIn("POST", headers.get("access-control-allow-methods", ""))
+
+    def test_options_preflight_returns_204_without_forwarding(self):
+        """A browser OPTIONS preflight (with an Origin header) is answered
+        directly by the sidecar with 204 + CORS headers and is NOT forwarded
+        to Bifrost, so a preflight never touches the upstream.
+        """
+        body_count_before = len(self.stub.received_bodies)
+        conn = http.client.HTTPConnection(
+            self.sidecar.server_address[0],
+            self.sidecar.server_address[1], timeout=30)
+        conn.request("OPTIONS", "/v1/chat/completions", body=b"",
+                     headers={"Origin": "http://app.local",
+                              "Access-Control-Request-Method": "POST"})
+        resp = conn.getresponse()
+        status = resp.status
+        headers = {k.lower(): v for k, v in resp.getheaders()}
+        resp.read()
+        conn.close()
+        self.assertEqual(status, 204, "preflight must short-circuit with 204")
+        self.assertEqual(headers.get("access-control-allow-origin"), "*")
+        self.assertIn("POST", headers.get("access-control-allow-methods", ""))
+        self.assertEqual(
+            len(self.stub.received_bodies), body_count_before,
+            "OPTIONS preflight must NOT be forwarded to the stub upstream")
+
+
 class TestJsonlWriterHandle(unittest.TestCase):
     """Persistent-handle + fsync scheduler behavior for ``JsonlWriter``.
 
