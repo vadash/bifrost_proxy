@@ -15,6 +15,8 @@ non-pooled requests; the only change is *where* each concern lives.
 from __future__ import annotations
 
 import json
+import sys
+import traceback
 import http.client
 import queue
 import threading
@@ -219,6 +221,12 @@ class Handler(BaseHTTPRequestHandler):
 
         except Exception as e:
             error_str = repr(e)
+            # Surface routing crashes to stderr so they're not silently
+            # swallowed into a bare 502 (the sidecar.log decision line only
+            # fires from the finally block for pooled requests that reached
+            # upstream; a pre-upstream exception leaves no other trace).
+            print(f"[sidecar] proxy() exception: {e!r}", file=sys.stderr, flush=True)
+            traceback.print_exc(file=sys.stderr)
             if not self._response_line_sent:
                 try:
                     self.send_error(502, "sidecar upstream error")

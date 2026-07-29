@@ -21,6 +21,8 @@ import importlib
 import json
 import time
 import unittest
+import os
+import tempfile
 
 # ``sidecar-2`` is not a valid ``import`` statement identifier (hyphen), so
 # load the modules via importlib.
@@ -210,10 +212,14 @@ class TestShufflePools(unittest.TestCase):
 
 
 class TestReserveBifrost(unittest.TestCase):
-    """``load_pools(reserve_bifrost=N)`` drops the first N alpha-sorted
-    providers of each pool (matching Bifrost's own lexicographic auto-sort)."""
-
-    POOLS_PATH = None  # populated by setUpClass from a temp file
+    """``load_pools(reserve_bifrost=N)`` reserves at most 1 alpha-sorted
+    provider from the FIRST pool only, leaving it for the Bifrost auto route.
+    Small pools (< 2 providers) are skipped so they're never drained empty;
+    every other pool keeps its full list so a smaller second tier is not
+    starved by the reservation. The reservation is capped at 1 regardless
+    of N because only one provider is needed to seed the Bifrost round-robin
+    relay for the first model; reserving more would over-dedicate capacity.
+    """
 
     @classmethod
     def setUpClass(cls) -> None:
@@ -234,20 +240,77 @@ class TestReserveBifrost(unittest.TestCase):
         pools = load_pools(self.POOLS_PATH, reserve_bifrost=0)
         self.assertEqual(pools["z-ai/glm-5.2"], P)
 
-    def test_reserve_three_drops_alpha_first_three(self) -> None:
-        # Bifrost alpha-sorts lexicographically: nvidia-1, nvidia-10, nvidia-2,
-        # ... so the first three reserved are nvidia-1, nvidia-10, nvidia-2.
+    def test_reserve_drops_alpha_first_one(self) -> None:
+        # Bifrost alpha-sorts lexicographically: nvidia-1 is the first, so it
+        # is reserved for the Bifrost auto route. Cap is 1 regardless of N.
         pools = load_pools(self.POOLS_PATH, reserve_bifrost=3)
         kept = pools["z-ai/glm-5.2"]
         self.assertNotIn("nvidia-1", kept)
-        self.assertNotIn("nvidia-10", kept)
-        self.assertNotIn("nvidia-2", kept)
-        self.assertEqual(len(kept), len(P) - 3)
-        self.assertEqual(sorted(kept), sorted(set(P) - {"nvidia-1", "nvidia-10", "nvidia-2"}))
+        self.assertEqual(len(kept), len(P) - 1)
+        self.assertEqual(
+            sorted(kept), sorted(set(P) - {"nvidia-1"})
+        )
 
-    def test_reserve_more_than_pool_yields_empty(self) -> None:
+    def test_reserve_more_than_pool_yields_full_minus_one(self) -> None:
+        # Cap is 1 even when N exceeds the pool size: keep len-1, never empty.
         pools = load_pools(self.POOLS_PATH, reserve_bifrost=len(P))
-        self.assertEqual(pools["z-ai/glm-5.2"], [])
+        kept = pools["z-ai/glm-5.2"]
+        self.assertEqual(len(kept), len(P) - 1)
+        self.assertNotIn(sorted(P)[0], kept)
+
+class TestReserveBifrostMultiPool(unittest.TestCase):
+    """Reservation never drains a small second-tier pool to empty.
+
+    Reproduces the original bug: a 2-provider ``kilo-auto/free`` pool paired
+    with a 15-provider ``z-ai`` pool and ``--reserve-bifrost=3`` used to drop
+    the first 3 alpha-sorted providers from EVERY pool, emptying the 2-pool
+    and causing IndexError/TypeError 502s on the fast path. The fix reserves
+    at most 1 from the FIRST pool only; every other pool keeps its full list.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls._tmpdir = tempfile.mkdtemp()
+        cls.POOLS_PATH = os.path.join(cls._tmpdir, "pools.json")
+        big = [f"nvidia-{i}" for i in range(1, 16)]
+        small = ["kilo-01", "kilo-02"]
+        import json as _json
+        with open(cls.POOLS_PATH, "w", encoding="utf-8") as f:
+            _json.dump(
+                {"z-ai/glm-5.2": big, "kilo-auto/free": small}, f
+            )
+        cls._big = big
+        cls._small = small
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        import shutil
+        shutil.rmtree(cls._tmpdir, ignore_errors=True)
+
+    def test_second_tier_pool_untouched_by_reservation(self) -> None:
+        pools = load_pools(self.POOLS_PATH, reserve_bifrost=3)
+        # First pool: drops 1 (nvidia-1 reserved), keeps 14.
+        self.assertEqual(len(pools["z-ai/glm-5.2"]), len(self._big) - 1)
+        self.assertNotIn("nvidia-1", pools["z-ai/glm-5.2"])
+        # Second tier: UNTOUCHED, both providers remain, never drained empty.
+        self.assertEqual(pools["kilo-auto/free"], self._small)
+        self.assertEqual(len(pools["kilo-auto/free"]), 2)
+
+    def test_empty_pool_rejected_by_pooled_gate(self) -> None:
+        # Even if a pool were empty, pooled_gate must return None (passthrough)
+        # instead of letting plan_fast_request IndexError on an empty ring.
+        cfg = SidecarConfig(
+            upstream_host="h", upstream_port=1, listen_host="h", listen_port=1,
+            pools={"kilo-auto/free": []}, pools_path="",
+            log_path=os.path.join(self._tmpdir, "s.log"),
+            capture_path=os.path.join(self._tmpdir, "c.jsonl"),
+        )
+        state = RoutingState(cfg, shuffle_pools=False)
+        gate = _state_mod.pooled_gate(
+            state, {"model": "kilo-auto/free",
+                    "messages": [{"role": "user", "content": "hi"}]}
+        )
+        self.assertIsNone(gate)
 
 
 class TestPlanPooledRequest(unittest.TestCase):

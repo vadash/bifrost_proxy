@@ -28,8 +28,8 @@ indistinguishable from hitting Bifrost directly.
 python -m sidecar-2
 ```
 
-Reserve the first 3 alpha-sorted nvidia providers for the Bifrost auto route
-(sidecar pools the remaining 12):
+Reserve 1 alpha-sorted provider from the first pool for the Bifrost auto route
+(sidecar pools the remaining 14, every other pool keeps its full list):
 ```cmd
 python -m sidecar-2 --reserve-bifrost 3
 ```
@@ -48,8 +48,9 @@ it is a behaviour change, not a bug.
 
 `start_sidecar.cmd` (repo-root launcher) deletes `sidecar-2/sidecar.log` before
 launch (rotation guard) and runs `python -m sidecar-2 --reserve-bifrost 3`
-(reserves first 3 alpha-sorted nvidia providers for the Bifrost auto route;
-sidecar pools the remaining 12).
+(reserves 1 alpha-sorted provider from the first pool only for the Bifrost
+auto route; sidecar pools 14 nvidia providers, every other pool keeps its
+full list).
 
 Hub start: name `sidecar`,
 application `C:\Users\vadash\AppData\Local\Python\pythoncore-3.14-64\python.exe`,

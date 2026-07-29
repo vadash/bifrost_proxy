@@ -94,9 +94,16 @@ assignment's random tie-break: that decides *which* pin a cold session lands
 on; the shuffle decides the order of the *rest* of the ring.
 
 **Reserve prefix for Bifrost auto (``--reserve-bifrost N``).** When N > 0,
-``load_pools`` drops the first N alpha-sorted providers of each pool
-(matching Bifrost's own lexicographic auto-sort: `nvidia-1, nvidia-10,
-nvidia-2, …`), reserving them for the Bifrost auto route so the sidecar never
-routes to them. `start_sidecar.cmd` passes `--reserve-bifrost 3` (first 3 of
-the 15 nvidia providers), leaving 12 for sidecar pooling. CLI flag: integer
-count, default 0 (no reservation).
+``load_pools`` reserves at most **1** alpha-sorted provider from the
+**first** pool only (``pools.json`` first key), capping at 1 regardless of N
+so a pool is never drained below its declared size minus 1. Every other pool
+keeps its full provider list — this matters when a config adds a smaller
+second tier (e.g. a 2-provider ``kilo-auto/free`` pool alongside the 15-pool
+``z-ai``); reserving from every pool used to drain the small pool to 0 and
+502 with ``IndexError``/``TypeError`` on the fast path. The reservation
+matches Bifrost's lexicographic auto-sort (``nvidia-1, nvidia-10, nvidia-2,
+…``) so the sidecar never reaches the reserved providers. Pools with <= 1
+providers are skipped entirely. ``start_sidecar.cmd`` passes
+``--reserve-bifrost 3`` (reserves ``nvidia-1`` from the first pool, leaving
+14 for sidecar pooling; all other pools keep their full list). CLI flag:
+integer count, default 0 (no reservation).

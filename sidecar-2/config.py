@@ -83,10 +83,16 @@ def load_pools(path: str, reserve_bifrost: int = 0) -> dict[str, list[str]]:
     On missing file or parse error, print a ``[sidecar] WARNING: ...`` line to
     stdout and return ``{}`` (pure passthrough, no pooled models).
 
-    When ``reserve_bifrost > 0``, the first that many alpha-sorted providers
-    of each pool are dropped (reserved for the Bifrost auto route, which
-    alpha-sorts exactly the same way, so the sidecar never routes to them).
-    A notice is printed per pool when any providers are dropped.
+    When ``reserve_bifrost > 0``, the FIRST pool (the first ``pools.json``
+    entry) drops up to ``min(1, reserve_bifrost)`` alpha-sorted providers —
+    reserving them for the Bifrost auto route (which alpha-sorts the same
+    way so the sidecar never reaches them). The reservation is capped at 1
+    so a pool is never left below its declared size minus 1; pools that
+    would be emptied are skipped entirely. Only the first pool reserves,
+    every other pool keeps its full provider list (so adding a second tier
+    with a smaller provider list like the 2-provider ``kilo-auto/free``
+    never has its providers stolen by the reservation). A notice is printed
+    per pool when any providers are dropped.
     """
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -102,17 +108,21 @@ def load_pools(path: str, reserve_bifrost: int = 0) -> dict[str, list[str]]:
 
     if reserve_bifrost > 0:
         reserved: set[str] = set()
-        for model, provs in data.items():
+        cap = min(1, reserve_bifrost)
+        for idx, (model, provs) in enumerate(data.items()):
             if not isinstance(provs, list):
                 continue
+            # Only the first pool reserves; never drain a pool below 1.
+            if idx != 0 or len(provs) <= 1 or cap < 1:
+                continue
             sorted_provs = sorted(provs)
-            keep = sorted_provs[reserve_bifrost:]
-            for p in sorted_provs[:reserve_bifrost]:
+            keep = sorted_provs[cap:]
+            for p in sorted_provs[:cap]:
                 reserved.add(p)
             data[model] = keep
         if reserved:
             print(
                 f"[sidecar] reserve_bifrost={reserve_bifrost}: reserved "
-                f"{sorted(reserved)} for the Bifrost auto route"
+                f"{sorted(reserved)} (first pool only, cap 1) for the Bifrost auto route"
             )
     return data

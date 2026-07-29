@@ -158,16 +158,25 @@ class RoutingState:
     ) -> int:
         """Return the pinned provider index for ``session_key``.
 
-        If known, refresh ``seen`` and return the stored pin; else compute a
-        least-loaded start (see ``_least_loaded``), store ``{"pin", "seen"}``
-        (no ``pin2`` key -- fast sessions add it via ``assign_pin_pair``),
-        and return the pin. Must be called under ``self.lock()``.
+        If known, refresh ``seen`` and return the stored pin (recomputing when
+        the stored pin is missing or out of range, e.g. after the pool
+        shrank via --reserve-bifrost); else compute a least-loaded start
+        (see ``_least_loaded``), store ``{"pin", "seen"}`` (no ``pin2`` key
+        -- fast sessions add it via ``assign_pin_pair``), and return the
+        pin. Returns 0 as a last resort when the pool is empty. Must be
+        called under ``self.lock()``.
         """
-        if session_key in self.pins:
-            self.pins[session_key]["seen"] = now
-            return self.pins[session_key]["pin"]
-
+        record = self.pins.get(session_key)
+        if record is not None:
+            record["seen"] = now
+            pin = record.get("pin")
+            if isinstance(pin, int) and 0 <= pin < len(providers):
+                return pin
+        # Fresh or corrupted record: (re)assign least-loaded.
         pin = self._least_loaded(providers, now, frozenset())
+        if pin is None:
+            pin = 0  # only reachable with an empty pool (already rejected by
+                     # pooled_gate; defensive fallback for a shrunken pool)
         self.pins[session_key] = {"pin": pin, "seen": now}
         return pin
 
@@ -184,15 +193,23 @@ class RoutingState:
         record keeps the shape ``{"pin", "pin2", "seen"}`` (``pin2`` omitted
         for 1-provider pools). Must be called under ``self.lock()``.
         """
+        if not providers:
+            # Defensive: an empty pool cannot be pinned. Both lanes None
+            # tells the caller (build_fast_lanes) to produce empty lanes;
+            # plan_fast_request would have short-circuited via pooled_gate,
+            # but guard against a pool that shrank between pin and plan.
+            return None, None
         record = self.pins.get(session_key)
         if record is not None:
             record["seen"] = now
-            pin_a = record["pin"]
-            if not 0 <= pin_a < len(providers):
+            pin_a = record.get("pin")
+            if not isinstance(pin_a, int) or not 0 <= pin_a < len(providers):
                 pin_a = self._least_loaded(providers, now, frozenset())
                 record["pin"] = pin_a
             pin_b = record.get("pin2")
-            if pin_b is not None and not 0 <= pin_b < len(providers):
+            if pin_b is not None and (
+                not isinstance(pin_b, int) or not 0 <= pin_b < len(providers)
+            ):
                 pin_b = None
             if pin_b is None and len(providers) > 1:
                 pin_b = self._least_loaded(
@@ -201,7 +218,6 @@ class RoutingState:
             if pin_b is not None:
                 record["pin2"] = pin_b
             return pin_a, pin_b
-
         pin_a = self._least_loaded(providers, now, frozenset())
         pin_b = (
             self._least_loaded(providers, now, frozenset({pin_a}))
@@ -360,7 +376,13 @@ def pooled_gate(state: RoutingState, parsed) -> tuple[str, list[str]] | None:
     pooled_model = parsed.get("model")
     if not state.is_pooled(pooled_model):
         return None
-    return pooled_model, state.pools[pooled_model]
+    providers = state.pools[pooled_model]
+    if not providers:
+        # An empty pool (e.g. over-reserved by --reserve-bifrost) cannot
+        # route; fall back to transparent passthrough so the request still
+        # reaches Bifrost verbatim instead of 502'ing on an empty ring.
+        return None
+    return pooled_model, providers
 
 
 def rewrite_body(body: dict, pooled_model: str, order: list[str]) -> bytes:

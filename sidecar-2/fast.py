@@ -51,6 +51,11 @@ def plan_fast_request(
         state.purge_expired(now)
         session_key, session_source = derive_session_key(parsed)
         pin_a, pin_b = state.assign_pin_pair(session_key, providers, now)
+        if pin_a is None or not providers:
+            # Empty pool: pooled_gate should have rejected this already;
+            # guard returns None so the proxy falls back to passthrough
+            # instead of IndexError'ing on lane_a[0].
+            return None
         lane_a, lane_b, desperate = state.build_fast_lanes(
             providers, pin_a, pin_b, now
         )
