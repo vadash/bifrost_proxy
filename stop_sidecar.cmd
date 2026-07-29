@@ -29,4 +29,17 @@ if "%KILLED%"=="0" (
     echo [DONE] Sidecar stopped.
 )
 
+rem --- bring the Tailscale node down (mirrors start_sidecar.cmd's Tailscale-based bind) ---
+where tailscale >nul 2>&1
+if errorlevel 1 (
+  echo [INFO] tailscale.exe not found on PATH - skipping Tailscale teardown.
+) else (
+  echo [stop] bringing Tailscale node down ...
+  tailscale down >nul 2>&1
+  if errorlevel 1 (
+    echo [WARN] tailscale down failed ^(may already be down, or not logged in^).
+  ) else (
+    echo [DONE] Tailscale node brought down.
+  )
+)
 endlocal
