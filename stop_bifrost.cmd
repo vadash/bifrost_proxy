@@ -16,9 +16,9 @@ for /f "tokens=5" %%P in ('netstat -ano -p tcp ^| findstr /R /C:":%PORT% .*LISTE
 )
 
 rem --- also kill any lingering @maximhq/bifrost node process by command line ---
-for /f "tokens=2 delims=," %%K in (
-    'wmic process where "name='node.exe' and CommandLine like '%%@maximhq/bifrost%%'" get ProcessId /format:csv 2^>nul ^| find /i "node.exe"'
-) do (
+rem     wmic is removed on modern Windows 11; use PowerShell Get-CimInstance
+rem     (the live replacement), mirroring stop_sidecar.cmd.
+for /f "delims=" %%K in ('powershell -NoProfile -Command "Get-CimInstance Win32_Process -Filter \"name='node.exe'\" | Where-Object { $_.CommandLine -like '*@maximhq/bifrost*' } | Select-Object -ExpandProperty ProcessId" 2^>nul') do (
     echo [stop] killing bifrost node PID %%K
     taskkill /F /PID %%K >nul 2>&1
     set "KILLED=1"

@@ -1,6 +1,9 @@
 @echo off
 setlocal
 
+rem --- ensure we run from the script's own directory ---
+cd /d "%~dp0"
+
 set "LISTEN_PORT=8088"
 set "UPSTREAM=127.0.0.1:8080"
 set "LISTEN=127.0.0.1:%LISTEN_PORT%"
@@ -26,7 +29,6 @@ if not errorlevel 1 (
 )
 
 echo Repoint your client baseUrl to http://%LISTEN%/v1  ^(Bifrost stays on :8080^)
-cd /d "%~dp0"
 
 rem --- rotate decision log: delete on start so it cannot overflow ---
 if exist "sidecar-2\sidecar.log" del /q "sidecar-2\sidecar.log"

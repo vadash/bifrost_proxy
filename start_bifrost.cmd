@@ -1,6 +1,10 @@
 @echo off
 SETLOCAL EnableDelayedExpansion
 
+rem --- ensure we run from the script's own directory ---
+cd /d "%~dp0"
+
+
 :: Define the port Bifrost uses (Default is 8080)
 set "PORT=8080"
 
