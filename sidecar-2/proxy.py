@@ -9,7 +9,14 @@ reads them off ``self.server`` (standard ``ThreadingHTTPServer`` wiring),
 so no module-level global is ever reached for.
 
 Behaviour is byte-for-byte identical to legacy proxy.py for both pooled and
-non-pooled requests; the only change is *where* each concern lives.
+non-pooled requests; the only change is *where* each concern lives -- with
+one exception: a pool-level circuit breaker. When the whole pool is
+rate-limited and the circuit is open, a pooled request is answered locally
+(429 + ``Retry-After``) and NOTHING is forwarded upstream, so the client
+never waits on a refused connection (and the breaker stops the 3x
+amplification that turned a single account-wide 429 into ~400 refused
+upstream calls). This local answer is the only pooled path that does not
+relay Bifrost's bytes.
 """
 
 from __future__ import annotations
@@ -162,6 +169,48 @@ class Handler(BaseHTTPRequestHandler):
             out.append((name, value))
         return out
 
+    @staticmethod
+    def _parse_retry_after(headers) -> float | None:
+        """Pull the upstream ``Retry-After`` (seconds) off an upstream
+        response's ``(name, value)`` header list.
+
+        Honours the bare-integer-seconds form only (the one NVIDIA emits
+        on a 429). The HTTP-date form is ignored (returns ``None``): we do
+        not parse it because (a) producing the right local ``Retry-After``
+        shape from a calendar date needs clock-skew reasoning we don't do
+        here, and (b) in practice the sidecar never sees one. ``None`` when
+        the header is absent or not an int.
+        """
+        for name, value in headers:
+            if name.lower() == "retry-after":
+                try:
+                    return float(int(value))
+                except (ValueError, TypeError):
+                    return None
+        return None
+
+    def _send_local_json(self, status: int, body: bytes, *, retry_after: int | None = None) -> None:
+        """Answer the client directly, without an upstream connection.
+
+        Used by the pool-circuit-open path (429 + ``Retry-After``) and the
+        fast path's 502 (no winner / transport failure). Emits CORS when
+        enabled, a JSON content-type, optional ``Retry-After``, and a
+        length-prefixed body; sets ``_response_line_sent`` so the outer
+        ``except`` block won't also try to ``send_error``.
+        """
+        self.send_response(status)
+        self._response_line_sent = True
+        if self._cors:
+            self._send_cors_headers()
+        self.send_header("Content-Type", "application/json")
+        if retry_after is not None:
+            self.send_header("Retry-After", str(retry_after))
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.wfile.write(body)
+        self.close_connection = True
+
     # --- Core forwarding logic -----------------------------------------------
     def proxy(self):
         self._response_line_sent = False
@@ -186,7 +235,9 @@ class Handler(BaseHTTPRequestHandler):
         keep_list = None          # kept[] ring used in the request + step-8 feedback
         desperate = False
         repin = None             # provider re-pinned this request (feedback), for logging
-
+        circuit_note = None        # "open"/"tripped"/"reset"/None -- logged in the circuit field
+        circuit_open_for = None    # secs remaining on an open pool circuit (None when closed)
+        retry_after = None         # upstream Retry-After (seconds) captured from the response
         try:
             # 1. Read request body.
             length = int(self.headers.get("Content-Length") or 0)
@@ -236,31 +287,57 @@ class Handler(BaseHTTPRequestHandler):
                     pin = plan["pin"]
                     keep_list = plan["keep_list"]
                     desperate = plan["desperate"]
-                    forward_body = plan["forward_body"]
+                    forward_body = plan.get("forward_body")
+                    circuit_open_for = plan["circuit_open_for"]
 
-            # Pooled-only headers to expose to the client after the relay.
-            pooled_headers = (
-                {"session": session_key[:12], "pin": keep_list[0]}
-                if pooled_model is not None
-                else None
-            )
-
-            # 3-6. Forward, detect stream, relay status/headers/body, extract provider.
-            response_status, is_stream, served_provider = self._forward_and_relay(
-                upstream_path, fwd_headers, forward_body, pooled_headers
-            )
-
-            # --- 6b. Post-response feedback (pooled requests only). ---
-            if pooled_model is not None:
-                repin = apply_feedback(
-                    self._state,
-                    session_key=session_key,
-                    providers=providers,
-                    keep_list=keep_list,
-                    served_provider=served_provider,
-                    response_status=response_status,
-                    error_str=error_str,
+            # Pool circuit OPEN: the whole pool is rate-limited, so do NOT
+            # forward (that only holds the rate-limit window open and
+            # multiplies the storm 3x via fallbacks). Answer locally with a
+            # 429 + Retry-After and the documented body. The response_status
+            # is recorded for the decision log; feedback is skipped because
+            # no upstream call happened. Falls through to the finally block
+            # which logs the decision with circuit="open".
+            if pooled_model is not None and circuit_open_for is not None:
+                secs = int(circuit_open_for) if circuit_open_for else 1
+                local_body = json.dumps({
+                    "error": {
+                        "message": f"sidecar: pool {pooled_model} "
+                                    f"rate-limited, circuit open",
+                        "type": "rate_limit_error",
+                    }
+                }).encode("utf-8")
+                self._send_local_json(429, local_body, retry_after=secs)
+                response_status = 429
+                circuit_note = "open"
+                self.close_connection = True
+            else:
+                # Pooled-only headers to expose to the client after the relay.
+                pooled_headers = (
+                    {"session": session_key[:12], "pin": keep_list[0]}
+                    if pooled_model is not None and keep_list
+                    else None
                 )
+
+                # 3-6. Forward, detect stream, relay, extract provider, capture Retry-After.
+                response_status, is_stream, served_provider, retry_after = (
+                    self._forward_and_relay(
+                        upstream_path, fwd_headers, forward_body, pooled_headers
+                    )
+                )
+
+                # --- 6b. Post-response feedback (pooled requests only). ---
+                if pooled_model is not None:
+                    repin, circuit_note = apply_feedback(
+                        self._state,
+                        session_key=session_key,
+                        providers=providers,
+                        keep_list=keep_list,
+                        served_provider=served_provider,
+                        response_status=response_status,
+                        error_str=error_str,
+                        pooled_model=pooled_model,
+                        retry_after=retry_after,
+                    )
 
             # 7. Connection close.
             self.close_connection = True
@@ -308,6 +385,7 @@ class Handler(BaseHTTPRequestHandler):
                     repin=repin,
                     response_status=response_status,
                     desperate=desperate,
+                    circuit=circuit_note,
                 )
 
             # Force connection close; never let an exception escape.
@@ -343,7 +421,7 @@ class Handler(BaseHTTPRequestHandler):
         fwd_headers: dict[str, str],
         forward_body: bytes,
         pooled_headers: dict | None,
-    ) -> tuple[int | None, bool | None, str | None]:
+    ) -> tuple[int | None, bool | None, str | None, float | None]:
         """Forward to Bifrost and relay the response back to the client.
 
         Steps 3-6 of the legacy ``proxy()``: open the upstream, send the
@@ -352,7 +430,9 @@ class Handler(BaseHTTPRequestHandler):
         pooled), relay the body (stream chunks vs buffered
         ``Content-Length``), then ``extract_provider`` on the buffered bytes
         and close the connection. Returns ``(status, is_stream,
-        served_provider)`` -- all ``None`` when an error escapes the caller's
+        served_provider, retry_after)`` -- the last is the upstream
+        ``Retry-After`` (seconds) parsed off the response headers, or
+        ``None`` when absent. All ``None`` when an error escapes the caller's
         ``except`` block (status was never read).
         """
         conn = None
@@ -360,6 +440,7 @@ class Handler(BaseHTTPRequestHandler):
             conn, resp, response_status, resp_headers, is_stream = self._open_upstream_meta(
                 upstream_path, self.command, forward_body, fwd_headers,
             )
+            retry_after = self._parse_retry_after(resp_headers)
 
             # 4. Status line.
             self.send_response(response_status)
@@ -403,7 +484,7 @@ class Handler(BaseHTTPRequestHandler):
             if is_stream:
                 served_provider = extract_provider(bytes(sse_buf), is_stream=True)
 
-            return response_status, is_stream, served_provider
+            return response_status, is_stream, served_provider, retry_after
         finally:
             try:
                 conn.close()
@@ -420,12 +501,46 @@ class Handler(BaseHTTPRequestHandler):
         when the first finisher is premature-truncated does it wait for the
         second lane (needed for biggest-partial-wins). The loser keeps
         running as a daemon -- never cancelled, never joined.
+
+        When the pool circuit is open (``plan["circuit_open_for"]``) the race
+        is never started: ``plan_fast_request`` short-circuits with empty
+        lanes, so we answer locally (429 + ``Retry-After``, same body as the
+        single path) without touching upstream and log one ``circuit="open"``
+        decision record. Without this the two ``/fast`` lanes would bypass
+        the breaker and double the amplification.
         """
 
         cfg = self._cfg
         state = self._state
         providers = plan["providers"]
         session_key = plan["session_key"]
+        pooled_model = plan["pooled_model"]
+        circuit_open_for = plan.get("circuit_open_for")
+
+        if circuit_open_for is not None:
+            # Open circuit: answer locally, never forward, one decision log.
+            secs = int(circuit_open_for) if circuit_open_for else 1
+            local_body = json.dumps({
+                "error": {
+                    "message": f"sidecar: pool {pooled_model} "
+                                f"rate-limited, circuit open",
+                    "type": "rate_limit_error",
+                }
+            }).encode("utf-8")
+            self._send_local_json(429, local_body, retry_after=secs)
+            write_decision_log(
+                state, self._log,
+                session_key=session_key,
+                session_source=plan["session_source"],
+                pin=None,
+                keep_list=None,
+                served_provider=None,
+                repin=None,
+                response_status=429,
+                desperate=plan["desperate"],
+                circuit="open",
+            )
+            return
 
         lanes = [("a", plan["lane_a"], plan["body_a"])]
         if plan["body_b"] is not None:
@@ -437,6 +552,7 @@ class Handler(BaseHTTPRequestHandler):
             conn = None
             status = None
             resp_headers: list = []
+            retry_after: float | None = None
             body = b""
             is_stream = None
             error = None
@@ -444,6 +560,7 @@ class Handler(BaseHTTPRequestHandler):
                 conn, resp, status, resp_headers, is_stream = self._open_upstream_meta(
                     upstream_path, self.command, lane_body, fwd_headers,
                 )
+                retry_after = self._parse_retry_after(resp_headers)
                 try:
                     if is_stream:
                         buf = bytearray()
@@ -476,7 +593,7 @@ class Handler(BaseHTTPRequestHandler):
                 if body else None
             )
             complete = is_complete(status, bool(is_stream), body, error)
-            repin = apply_fast_feedback(
+            repin, circuit_note = apply_fast_feedback(
                 state,
                 session_key=session_key,
                 providers=providers,
@@ -485,6 +602,8 @@ class Handler(BaseHTTPRequestHandler):
                 served_provider=served_provider,
                 response_status=status,
                 error_str=error,
+                pooled_model=pooled_model,
+                retry_after=retry_after,
             )
             write_capture(
                 cfg, self._capture, self.headers,
@@ -505,6 +624,7 @@ class Handler(BaseHTTPRequestHandler):
                 repin=repin,
                 response_status=status,
                 desperate=plan["desperate"],
+                circuit=circuit_note,
             )
             q.put({
                 "lane": lane,
@@ -534,16 +654,7 @@ class Handler(BaseHTTPRequestHandler):
             winner = ordered[pick_winner(ordered)]
 
         if winner["status"] is None:
-            body = b'{"error":"sidecar upstream error"}'
-            self.send_response(502)
-            if self._cors:
-                self._send_cors_headers()
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
-            self.send_header("Connection", "close")
-            self.end_headers()
-            self.wfile.write(body)
-            self.close_connection = True
+            self._send_local_json(502, b'{"error":"sidecar upstream error"}')
             return
 
         self.send_response(winner["status"])

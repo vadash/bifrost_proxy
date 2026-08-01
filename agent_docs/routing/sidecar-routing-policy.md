@@ -22,21 +22,39 @@ Because Bifrost walks the body `fallbacks`
 verbatim (see routing-facts), **send-order == try-order up to the cap below**,
 so `keep_list[1]` is always the first provider tried after the primary.
 
-## Upstream fallback cap: primary + 2
+## Upstream fallback cap: primary + 2 (or primary only when desperate / probing)
 
-`plan_pooled_request` (*state.py*) writes only **`keep_list[1:3]`** into the
-forwarded body's `fallbacks` — the forced primary plus two fallbacks, never
-the whole ring — even though `keep_list` retains all providers. Why: during
-NVIDIA upstream congestion the relay returns 504 after its first-byte
-timeout, and forwarding all 11 fallbacks of a 12-provider pool made one
-congested request burn ~31s x 12 before failing. The cap bounds that to at
-most 3 attempts (~93s). The full ring stays in memory so pins, cooldowns,
-and `fallback_feedback` (which reads `keep_list` directly, not the forwarded
-`fallbacks`) are unaffected: `keep_list[1]` is still the first-skipped
-stampede target, the whole-chain-failure path still cools `keep_list[0]`.
-Edge cases are pure slicing: a 1-provider pool forwards `[]`, a 2-provider
-pool forwards 1 fallback, slicing past the end is safe. The cap is a
-hard-coded slice, not a config knob.
+`plan_pooled_request` (*state.py*) rewrites the body via `state.rewrite_body`,
+which splits primary + fallbacks into `order[0]` and `order[1:1+max_fallbacks]`
+(keyword-only, default `max_fallbacks=2`). The normal pooled path forwards
+only **`keep_list[1:3]`** — the forced primary plus two fallbacks, never the
+whole ring — even though `keep_list` retains all providers. Why: during NVIDIA
+upstream congestion the relay returns 504 after its first-byte timeout, and
+forwarding all 11 fallbacks of a 12-provider pool made one congested request
+burn ~31s x 12 before failing. The cap bounds that to at most 3 attempts
+(~93s). Edge cases are pure slicing: a 1-provider pool forwards `[]`, a
+2-provider pool forwards 1 fallback, slicing past the end is safe.
+
+The cap is **not** a flat hard-coded slice. On two paths the planner forces
+`max_fallbacks=0` so one client request makes exactly ONE upstream call
+(`"fallbacks": []`), not three:
+
+- **Desperate** (all providers hot): see the send-order section — `desperate`
+  is True, so the body forwards the primary only. This kills the 3x
+  amplification that held the account rate-limit window open during the
+  original 429 storm.
+- **Half-open circuit probe**: the single request the breaker lets through to
+  test a lapsed limit is likewise primary-only — a probe must not fan out 3
+  lanes into the limit it is testing.
+
+Both `/fast` lanes get the same `max_fallbacks=0` on their desperate/probe path
+(`plan_fast_request` mirrors this). The full ring stays in memory so pins,
+cooldowns, and `fallback_feedback` (which reads `keep_list` directly, not the
+forwarded `fallbacks`) are unaffected: `keep_list[1]` is still the
+first-skipped stampede target, the whole-chain-failure path still cools
+`keep_list[0]`. The breaker itself — when to drop to primary-only by opening
+the whole pool — is a separate concern; see
+[pool-circuit-breaker.md](pool-circuit-breaker.md).
 
 ## Post-response feedback: two paths
 
@@ -54,11 +72,26 @@ first-skipped is the stampede/overload target.
 
 **Whole-chain failure** (`elif err_path`): 5xx/429/exception from the whole
 chain → cool the forced primary (`keep_list[0]`) and advance the pin one step.
+A 429 is also an ACCOUNT-WIDE signal: when cooling the primary leaves EVERY
+provider hot (`state.all_hot`), the pool-level circuit TRIPS (stops forwarding
+the whole pool) instead of repinning into a ring that will just 429 again;
+generally see [pool-circuit-breaker.md](pool-circuit-breaker.md). A transport
+error or a 5xx is a per-provider fault only and never trips the circuit.
+Any genuine recovery — a 2xx (fallback or primary) on a pool whose circuit was
+actually open — RESETS the circuit and clears the collateral cooldowns it left
+behind; an ordinary 2xx on a pool that never tripped leaves legitimate
+per-provider cooldowns alone.
 
-`apply_feedback` returns the provider it re-pinned to (`repin_to`, or
-`keep_list[1]` on the failure path), else `None` — threaded straight into the
-`repin` log field so logging never re-derives it from `state.pins` under a
-second lock (see runbook "sidecar.log record shape").
+`apply_feedback` / `apply_fast_feedback` return a **`(repin, circuit_note)`**
+pair, not a bare provider. `repin` is the provider this request re-pinned to
+(`repin_to`, or `keep_list[1]` on the failure path), else `None` — threaded
+straight into the `repin` log field so logging never re-derives it from
+`state.pins` under a second lock. `circuit_note` is `"tripped"` (this 429
+opened the circuit), `"reset"` (this 2xx recovered a tripped circuit), or
+`None` (the common case: no circuit event) — threaded into the decision log's
+`circuit` field (see runbook "sidecar.log record shape"). The breaker's
+state machine, escalating window, and reset-narrowing internals are in
+[pool-circuit-breaker.md](pool-circuit-breaker.md).
 
 ## `is_fallback` is NOT the signal; `fell_back` is
 

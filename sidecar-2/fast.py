@@ -35,21 +35,93 @@ def plan_fast_request(
     forwards verbatim as a single request, same as the non-fast path).
 
     Otherwise, under ``state.lock()``: purge -> derive session key ->
-    ``assign_pin_pair`` -> ``build_fast_lanes``, then write the bookkeeping
-    record so the pins always track the actual lane primaries. The body
-    rewrite runs outside the lock (same rationale as
+    circuit decision -> ``assign_pin_pair`` -> ``build_fast_lanes``, then
+    write the bookkeeping record so the pins always track the actual lane
+    primaries. The body rewrite runs outside the lock (same rationale as
     ``plan_pooled_request``): each lane gets a deep-copied body with
     ``model = "{lane_primary}/{pooled}"`` and ``fallbacks`` for the rest of
     the lane (lanes are already <= 3, so the upstream cap holds).
+
+    Circuit states (mirroring ``plan_pooled_request`` so the ``/fast`` lane
+    never bypasses the breaker):
+
+    * OPEN: the race is NOT built -- an early-return dict carries
+      ``circuit_open_for`` (seconds until re-open for a probe) plus
+      ``pooled_model`` / ``providers`` / ``session_key`` / ``session_source``
+      so ``_proxy_fast`` answers 429 locally. Without this the two disjoint
+      lanes would double the 3x amplification the circuit exists to stop.
+    * HALF-OPEN: consult ``circuit_probe``. If it returns False a probe is
+      already in flight on the single path -- short-circuit with
+      ``circuit_open_for`` (``max(1.0, circuit_retry_after(...))``) rather
+      than racing two lanes against the still-limited account. If it returns
+      True this ``/fast`` request IS the probe: the race still runs, but each
+      lane is forced to ``max_fallbacks=0`` (primary-only) so the probe does
+      not fan out 2 lanes x 3 providers = 6 upstream calls into the limit it
+      is testing.
+    * CLOSED: the normal race.
+
+    DESPERATE (all providers hot): even on the normal race path, ``_lane_body``
+    passes ``max_fallbacks=0`` so a desperate ``/fast`` request sends one
+      call per lane (primary-only) instead of three -- mirroring
+      ``plan_pooled_request`` and killing the same 3x-per-lane amplification
+      the single-path fix targets.
     """
     gate = pooled_gate(state, parsed)
     if gate is None:
         return None
     pooled_model, providers = gate
 
+    session_key, session_source = derive_session_key(parsed)
+
     with state.lock():
         state.purge_expired(now)
-        session_key, session_source = derive_session_key(parsed)
+        if state.circuit_open(pooled_model, now):
+            # Pool is rate-limited end to end; do not race. Emit the same
+            # short-circuit shape as plan_pooled_request so /fast answers
+            # locally instead of sending two more refused lanes upstream.
+            return {
+                "pooled_model": pooled_model,
+                "providers": providers,
+                "session_key": session_key,
+                "session_source": session_source,
+                "pin_a": None,
+                "pin_b": None,
+                "lane_a": [],
+                "lane_b": [],
+                "desperate": True,
+                "body_a": None,
+                "body_b": None,
+                "circuit_open_for": state.circuit_retry_after(
+                    pooled_model, now
+                ),
+            }
+        # Half-open: a lapsed entry still exists. Admit the probe / hold the
+        # race back so /fast cannot flood upstream while half-open.
+        if pooled_model in state.pool_circuit:
+            if state.circuit_probe(pooled_model, now):
+                probe = True
+            else:
+                # A probe is already in flight (the single path admitted it).
+                # Short-circuit exactly like the open case rather than racing
+                # two more lanes into the still-limited account.
+                return {
+                    "pooled_model": pooled_model,
+                    "providers": providers,
+                    "session_key": session_key,
+                    "session_source": session_source,
+                    "pin_a": None,
+                    "pin_b": None,
+                    "lane_a": [],
+                    "lane_b": [],
+                    "desperate": True,
+                    "body_a": None,
+                    "body_b": None,
+                    "circuit_open_for": max(
+                        1.0, state.circuit_retry_after(pooled_model, now)
+                    ),
+                }
+        else:
+            probe = False
         pin_a, pin_b = state.assign_pin_pair(session_key, providers, now)
         if pin_a is None or not providers:
             # Empty pool: pooled_gate should have rejected this already;
@@ -65,9 +137,15 @@ def plan_fast_request(
             providers.index(lane_b[0]) if lane_b else None,
             now,
         )
+        # Desperate OR this is the half-open probe -> each lane is primary
+        # only so one /fast request does not fan out 2 lanes x 3 providers.
+        force_primary_only = desperate or probe
 
     def _lane_body(lane: list[str]) -> bytes:
-        return rewrite_body(copy.deepcopy(parsed), pooled_model, lane)
+        return rewrite_body(
+            copy.deepcopy(parsed), pooled_model, lane,
+            max_fallbacks=0 if force_primary_only else 2,
+        )
 
     return {
         "pooled_model": pooled_model,
@@ -81,6 +159,7 @@ def plan_fast_request(
         "desperate": desperate,
         "body_a": _lane_body(lane_a),
         "body_b": _lane_body(lane_b) if lane_b else None,
+        "circuit_open_for": None,
     }
 
 

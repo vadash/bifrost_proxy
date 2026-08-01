@@ -115,9 +115,12 @@ Stdlib `unittest` only. Covers `build_send_order` (send-order + desperate),
 `fallback_feedback` (re-pin + first-skipped cooldown on 2xx fallback),
 `plan_pooled_request` (pooled decision + model/fallbacks rewrite),
 `sanitize_request_body` (orchestrates the three Claude rewriters),
-cooldown regression, cold-start pin spread, `shuffle_pools`,
 `load_pools(reserve_bifrost=N)`, sanitize rewrites, and `extract_provider`
-against recorded SSE fixtures.
+against recorded SSE fixtures. The pool-level circuit breaker is covered by
+`tests/test_circuit.py` (33 tests: trip window + escalation, half-open probe
+gate, `circuit_reset` boolean narrowing, purge stale-horizon, plan
+short-circuit and the primary-only probe plan), plus circuit cases in
+`test_handler.py` (relay-level trip / half-open reset) and `test_fast.py`.
 
 `tests/test_handler.py` adds end-to-end transport coverage: an in-process
 `StubBifrost(ThreadingHTTPServer)` + the real `Sidecar` threaded server,
@@ -174,14 +177,41 @@ Emitted by `pooled.write_decision_log` in `sidecar-2/pooled.py` (Step 3 of
 the proxy.py refactor split the former `write_logs` into `write_capture` +
 `write_decision_log`): ts,
 session, source, pin, primary, ring, cooldowns, served, fell_back, repin,
-status, desperate.
+status, desperate, circuit.
 `session` is the key truncated to 12 chars; `ring` is the kept send-order list
 for this request; `fell_back` is the derived fallback indicator (`is_fallback`
 is never emitted by this Bifrost build and is not logged). `repin` is the
 provider this request actually re-pinned the session to (returned by
 `apply_feedback`), else `null` when no re-pin happened — it does NOT echo the
 session's standing pin. A steady session (served by its primary, no fallback)
-logs `repin: null` even though it stays pinned.
+logs `repin: null` even though it stays pinned. `circuit` is the pool-level
+circuit-breaker event for this request, one of `"open"` (the breaker answered
+429 locally and forwarded nothing upstream — `pin`/`primary`/`ring` are `null`),
+`"tripped"` (this request's 429 opened the circuit), `"reset"` (this request's
+2xx closed a previously-tripped circuit and cleared the collateral cooldowns),
+or `null`/absent (no circuit event — the common case). A half-open probe that
+forwards normally has no `circuit` value; the breaker is a separate layer on
+top of the pinning/cooldown fields, not a fourth feedback path. See
+[pool-circuit-breaker.md](pool-circuit-breaker.md).
+
+## Symptoms: sustained 429s with `circuit: "open"`
+
+If `sidecar.log` shows a run of pooled requests at status 429 with
+`"circuit": "open"` (and `pin`/`primary`/`ring` all `null`), the pool-level
+circuit breaker is holding traffic back **deliberately** — the client is
+getting a well-formed local 429 + `Retry-After` and NO upstream call is being
+made. The cause is the upstream ACCOUNT-wide rate limit, not a sidecar bug:
+every provider refused at once, the breaker tripped, and forward requests are
+now short-circuited until the window lapses and a probe succeeds. Leave it
+alone — it is doing its job. To exercise the whole path locally, run the
+end-to-end smoke test against a stub that 429s everything:
+
+```cmd
+python -m sidecar-2.tests.smoke_storm
+```
+
+Mechanics, states, and tuning are in
+[pool-circuit-breaker.md](pool-circuit-breaker.md).
 
 ## JsonlWriter: persistent handle + fsync daemon (`io_jsonl.py`)
 
@@ -218,3 +248,5 @@ Lifecycle contracts worth knowing before touching `io_jsonl.py`:
 | `sidecar-2/capture.jsonl` | Raw capture (pooled only, gitignored; **off by default — add `--capture`**) |
 | `sidecar-2/tests/test_routing.py` | Stdlib `unittest` for `build_send_order`/`fallback_feedback`/cooldowns/cold-start (see Verify) |
 | `sidecar-2/tests/test_handler.py` | Stdlib `unittest` end-to-end transport test: real `Sidecar` server vs in-process stub upstream (single-path + `/fast` relays); regression test for the `resp.getheaders` bug |
+| `sidecar-2/tests/test_circuit.py` | Stdlib `unittest` for the pool-level circuit breaker (33 tests — see Verify) |
+| `sidecar-2/tests/smoke_storm.py` | Runnable end-to-end storm replay: stub upstream 429s everything, real `Sidecar` answers locally once the breaker trips (see Symptoms) |

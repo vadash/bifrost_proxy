@@ -187,7 +187,7 @@ class TestApplyFastFeedback(unittest.TestCase):
         with s.lock():
             s.assign_pin_pair("s1", P, now)
         lane_keep = [P[2], P[3], P[4]]
-        repinned = apply_fast_feedback(
+        repinned, circuit_note = apply_fast_feedback(
             s,
             session_key="s1",
             providers=P,
@@ -196,19 +196,30 @@ class TestApplyFastFeedback(unittest.TestCase):
             served_provider=None,
             response_status=500,
             error_str=None,
+            pooled_model="z-ai/glm-5.2",
         )
         self.assertEqual(repinned, P[3])
+        # 500 is per-provider only: no circuit event.
+        self.assertIsNone(circuit_note)
         with s.lock():
             self.assertTrue(s.cooldown_is_hot(P[2], time.time()))
             self.assertEqual(s.pins["s1"]["pin2"], P.index(P[3]))
 
-    def test_fallback_served_cools_primary_and_repins(self) -> None:
+    def test_fallback_served_repins_and_keeps_stampede_cooldown(self) -> None:
+        # When the circuit was NEVER tripped, a 2xx fallback must NOT nuke the
+        # legitimate per-provider cooldowns. ``fast_lane_feedback`` for a 2xx
+        # fallback off the primary cools the LAN PRIMARY (the stampede
+        # cooldown) and re-pins to the server; ``circuit_reset`` is called but
+        # returns False (no tripped circuit), so ``circuit_note`` stays None
+        # and the freshly-triggered cooldown on the lane primary SURVIVES.
+        # (Old WRONG behaviour asserted the cooldown was wiped + note "reset".)
         s = _state()
         now = time.time()
         with s.lock():
             s.assign_pin_pair("s1", P, now)
         lane_keep = [P[0], P[1], P[2]]
-        repinned = apply_fast_feedback(
+        self.assertIsNone(s.pool_circuit.get("z-ai/glm-5.2"))
+        repinned, circuit_note = apply_fast_feedback(
             s,
             session_key="s1",
             providers=P,
@@ -217,11 +228,58 @@ class TestApplyFastFeedback(unittest.TestCase):
             served_provider=P[1],
             response_status=200,
             error_str=None,
+            pooled_model="z-ai/glm-5.2",
         )
+        # The lane re-pins to the server that answered.
         self.assertEqual(repinned, P[1])
+        self.assertEqual(s.pins["s1"]["pin"], P.index(P[1]))
+        # No circuit was tripped -> no recovery event; note stays None.
+        self.assertIsNone(circuit_note)
+        # The legitimate 2xx-fallback stampede cooldown on the lane primary
+        # (P[0]) SURVIVES: an ordinary success does not signal account-wide
+        # recovery, so collateral-cooldown clearing is not justified.
         with s.lock():
             self.assertTrue(s.cooldown_is_hot(P[0], time.time()))
-            self.assertEqual(s.pins["s1"]["pin"], P.index(P[1]))
+        self.assertIsNone(s.pool_circuit.get("z-ai/glm-5.2"))
+
+    def test_2xx_after_trip_resets_circuit_and_clears_collateral(self) -> None:
+        # D2 recovery path: when the circuit WAS tripped, a 2xx really does
+        # signal account-wide recovery. ``circuit_reset`` returns True ->
+        # circuit_note == "reset" AND the collateral provider cooldowns are
+        # cleared. This proves narrowed reset still recovers a real trip.
+        s = _state()
+        now = time.time()
+        model = "z-ai/glm-5.2"
+        with s.lock():
+            s.assign_pin_pair("s1", P, now)
+            # Trip the circuit: cool every provider (collateral), then trip.
+            for p in P:
+                s.cooldown_trigger(p, now)
+            s.circuit_trip(model, now)
+            self.assertTrue(s.circuit_open(model, now))
+        lane_keep = [P[0], P[1], P[2]]
+        repinned, circuit_note = apply_fast_feedback(
+            s,
+            session_key="s1",
+            providers=P,
+            lane="a",
+            lane_keep=lane_keep,
+            served_provider=P[1],
+            response_status=200,
+            error_str=None,
+            pooled_model=model,
+        )
+        # Real recovery: circuit existed -> reset returns True -> "reset".
+        self.assertEqual(circuit_note, "reset")
+        self.assertEqual(repinned, P[1])
+        # The collateral cooldowns are cleared (the pool is no longer
+        # desperate after recovery), and the circuit entry is gone.
+        with s.lock():
+            for p in P:
+                self.assertFalse(
+                    s.cooldown_is_hot(p, time.time()),
+                    f"collateral cooldown on {p} must be cleared on reset")
+            self.assertIsNone(s.pool_circuit.get(model))
 
 
 class TestIsComplete(unittest.TestCase):

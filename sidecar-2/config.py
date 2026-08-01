@@ -61,7 +61,16 @@ class SidecarConfig:
     default_cooldown: float = 600.0  # provider cooldown duration (s)
     upstream_timeout: float = 600.0  # per-upstream request timeout (s)
     chunk_size: int = 8192         # stream relay chunk size (bytes)
+    circuit_base: float = 20.0  # pool circuit-breaker: first open window (s)
+    circuit_max: float = 120.0  # cap for the escalating open window (s)
 
+    # Pool-level circuit breaker. Upstream rate limits are ACCOUNT-wide, not
+    # per-provider, so a per-provider cooldown alone cascades every provider
+    # into permanent desperate mode within seconds (all 15 trip at once). The
+    # circuit opens the WHOLE pool and lets the proxy answer 429 locally,
+    # stopping upstream traffic. The open window escalates so a sustained
+    # account limit backs off harder: ``circuit_base`` on the first trip,
+    # doubling on each later trip, capped at ``circuit_max``.
 
     pools: dict[str, list[str]] = field(default_factory=dict)
 

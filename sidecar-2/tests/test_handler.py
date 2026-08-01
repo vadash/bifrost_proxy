@@ -23,6 +23,7 @@ import json
 import os
 import tempfile
 import threading
+import time
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -538,6 +539,264 @@ class TestJsonlWriterHandle(unittest.TestCase):
             except OSError:
                 pass
 
+
+
+# Body the 429 stub returns. No routing_info on purpose: a 429 from the
+# rate-limited account carries no provider hint, so extract_provider resolves
+# to None and the feedback path runs the whole-chain-failure branch (cool the
+# forced primary) -- which is exactly the path that trips the pool circuit
+# once the last cold provider goes hot.
+_STUB_BODY_429 = b'{"error":{"message":"rate limit","type":"rate_limit_error"}}'
+
+
+class StubHandler429(BaseHTTPRequestHandler):
+    """Reply 429 with ``Retry-After: 7`` and capture the request body."""
+
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *a):
+        pass
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length") or 0)
+        body = self.rfile.read(length) if length else b""
+        try:
+            parsed = json.loads(body)
+        except Exception:
+            parsed = None
+        with self.server._lock:
+            self.server.received_bodies.append(parsed)
+        self.send_response(429)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Retry-After", "7")
+        self.send_header("Content-Length", str(len(_STUB_BODY_429)))
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.wfile.write(_STUB_BODY_429)
+        self.close_connection = True
+
+
+class StubBifrost429(ThreadingHTTPServer):
+    daemon_threads = True
+
+    def __init__(self, addr):
+        super().__init__(addr, StubHandler429)
+        self._lock = threading.Lock()
+        self.received_bodies: list = []
+
+
+class TestHandlerCircuit(unittest.TestCase):
+    """Pool-level circuit breaker: a 429 storm must stop at the sidecar.
+
+    Regression for the self-inflicted 429 storm: when the whole pool is
+    rate-limited (account-wide, every provider 429s), the sidecar must NOT
+    keep sending forward+fallbacks that hold the rate-limit window open.
+    The circuit opens and the sidecar answers 429 locally; the stub is never
+    contacted again until the window lapses or a 2xx resets it.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp(prefix="sidecar-circuit-")
+        self.stub = StubBifrost429(("127.0.0.1", 0))
+        stub_port = self.stub.server_address[1]
+        cfg = SidecarConfig(
+            upstream_host="127.0.0.1",
+            upstream_port=stub_port,
+            listen_host="127.0.0.1",
+            listen_port=0,
+            pools_path="",
+            log_path=f"{self._tmp}/sidecar.log",
+            capture_path=f"{self._tmp}/capture.jsonl",
+            capture_enabled=False,
+            pools={"z-ai/glm-5.2": ["nvidia-1", "nvidia-2", "nvidia-3", "nvidia-4"]},
+            default_cooldown=600.0,
+            circuit_base=20.0,
+            circuit_max=120.0,
+        )
+        state = RoutingState(cfg, shuffle_pools=False)
+        capture_writer = JsonlWriter(cfg.capture_path)
+        log_writer = JsonlWriter(cfg.log_path)
+
+        self.sidecar = Sidecar(cfg.listen_addr, _proxy.Handler)
+        self.sidecar.cfg = cfg
+        self.sidecar.state = state
+        self.sidecar.capture_writer = capture_writer
+        self.sidecar.log_writer = log_writer
+
+        self.state = state
+
+        self._stub_thread = threading.Thread(
+            target=self.stub.serve_forever, daemon=True
+        )
+        self._stub_thread.start()
+        self._sidecar_thread = threading.Thread(
+            target=self.sidecar.serve_forever, daemon=True
+        )
+        self._sidecar_thread.start()
+
+    def tearDown(self):
+        self.stub.shutdown()
+        self.sidecar.shutdown()
+        self.stub.server_close()
+        self.sidecar.server_close()
+        self.sidecar.capture_writer.close()
+        self.sidecar.log_writer.close()
+        import shutil
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def _post(self, path, *, session_key="sess-A"):
+        body = json.dumps({
+            "model": "z-ai/glm-5.2",
+            "prompt_cache_key": session_key,
+            "messages": [{"role": "user", "content": "ping"}],
+        }).encode("utf-8")
+        conn = http.client.HTTPConnection(
+            self.sidecar.server_address[0],
+            self.sidecar.server_address[1],
+            timeout=30,
+        )
+        try:
+            conn.request(
+                "POST", path, body=body,
+                headers={"Content-Type": "application/json",
+                         "Content-Length": str(len(body))},
+            )
+            resp = conn.getresponse()
+        except (http.client.RemoteDisconnected,
+                http.client.BadStatusLine,
+                ConnectionError):
+            return None, {}, b""
+        status = resp.status
+        headers = {k.lower(): v for k, v in resp.getheaders()}
+        body = resp.read()
+        conn.close()
+        return status, headers, body
+
+    def _received_count(self) -> int:
+        with self.stub._lock:
+            return len(self.stub.received_bodies)
+
+    def _force_all_hot_except_primary(self) -> None:
+        """Pre-cool providers 2/3/4 so the session pinned to nvidia-1 has
+        exactly one cold provider; one 429 (cooling nvidia-1) then makes the
+        whole pool hot -> all_hot trips the circuit.
+        """
+        now = time.time()
+        with self.state.lock():
+            self.state.cooldown_trigger("nvidia-2", now)
+            self.state.cooldown_trigger("nvidia-3", now)
+            self.state.cooldown_trigger("nvidia-4", now)
+
+    def test_pooled_429_trips_circuit_and_next_request_is_local(self):
+        """CORE REGRESSION: a 429 with the pool about to be all-hot opens the
+        circuit; the immediately following request is answered by the sidecar
+        locally (429 + Retry-After) and the stub upstream is NOT contacted
+        again (its received_bodies count does not grow).
+        """
+        self._force_all_hot_except_primary()
+
+        # First request: forwarded to the 429 stub -> cools nvidia-1 -> all
+        # hot -> circuit trips (circuit_note="tripped"), opened for ~7s.
+        status1, headers1, _ = self._post("/v1/chat/completions")
+        self.assertEqual(status1, 429,
+                         "first request relays the upstream 429 and trips the "
+                         "circuit locally; the 429 must reach the client")
+        self.assertEqual(
+            self._received_count(), 1,
+            "the first pooled request must reach the stub upstream once")
+        self.assertEqual(self.state.cooldowns.get("nvidia-1") is not None, True)
+        # Circuit is now open: the pool circuit entry must persist.
+        with self.state.lock():
+            self.assertTrue(
+                self.state.circuit_open("z-ai/glm-5.2", time.time()),
+                "the 429 that cooled the last cold provider must have "
+                "opened the pool circuit")
+
+        # Second request: circuit open -> sidecar answers locally. The
+        # stub MUST NOT see this request.
+        before = self._received_count()
+        status2, headers2, body2 = self._post("/v1/chat/completions")
+        self.assertEqual(
+            self._received_count(), before,
+            "REGRESSION: with the circuit open the sidecar must answer "
+            "locally and NOT forward to the stub; removing the "
+            "short-circuit would make this count grow")
+        self.assertEqual(
+            status2, 429,
+            "an open circuit answers 429 locally, not the upstream status")
+        # Retry-After surfaced to the client, echoing the open window (>=1).
+        self.assertIn("retry-after", headers2,
+                       "the local 429 must carry a Retry-After so the client "
+                       "backs off the account limit")
+        ra = headers2["retry-after"]
+        self.assertTrue(int(ra) >= 1,
+                        f"Retry-After must be a positive int of seconds; got {ra!r}")
+
+        # Local 429 body is valid JSON of the documented shape.
+        decoded = json.loads(body2)
+        self.assertIn("error", decoded)
+        self.assertEqual(decoded["error"].get("type"), "rate_limit_error")
+        self.assertIn("rate-limited", decoded["error"].get("message", ""))
+
+    def test_success_resets_circuit_and_clears_stale_cooldowns(self):
+        """A 2xx while the circuit is open resets it (closes the circuit)
+        and discards the stale 600s per-provider cooldowns -- they were
+        collateral damage from the account-wide limit, not real per-provider
+        faults, so they must not keep the pool desperate after recovery.
+
+        The probe/half-open path is what admits the 2xx: the circuit's open
+        window is advanced past its expiry so the next request is allowed
+        through (probing=True), and the 2xx it returns resets everything.
+        """
+        self._force_all_hot_except_primary()
+        # Trip the circuit (window ~7s via the stub's Retry-After: 7).
+        self._post("/v1/chat/completions")
+        pool = "z-ai/glm-5.2"
+        with self.state.lock():
+            self.assertTrue(self.state.circuit_open(pool, time.time()))
+
+        # Advance the open window so the circuit is half-open (probe allowed).
+        with self.state.lock():
+            st = self.state.pool_circuit[pool]
+            st["open_until"] = time.time() - 0.001  # window already lapsed
+        # Swap the stub back to 2xx so the probe succeeds and resets.
+        self.stub.RequestHandlerClass = StubHandler
+        status_reset, _, _ = self._post("/v1/chat/completions")
+        self.assertEqual(status_reset, 200,
+                         "the half-open probe must be forwarded; a 2xx there "
+                         "resets the circuit")
+        # Circuit closed AND the stale cooldowns cleared.
+        with self.state.lock():
+            self.assertFalse(self.state.circuit_open(pool, time.time()),
+                             "a 2xx must reset (close) the pool circuit")
+            for p in ("nvidia-1", "nvidia-2", "nvidia-3", "nvidia-4"):
+                self.assertFalse(
+                    self.state.cooldowns.get(p, 0) > time.time(),
+                    f"circuit_reset must clear the stale cooldown on {p} "
+                    "(collateral from the account-wide limit, not a fault)")
+
+    def test_fast_path_short_circuits_open_circuit(self):
+        """/fast also honours the breaker: with the circuit open, /fast is
+        answered locally (429) and never races -- otherwise the two disjoint
+        lanes would bypass the breaker and double the amplification.
+        """
+        self._force_all_hot_except_primary()
+        # Trip the circuit via the single path first.
+        self._post("/v1/chat/completions")
+        with self.state.lock():
+            self.assertTrue(
+                self.state.circuit_open("z-ai/glm-5.2", time.time()))
+
+        before = self._received_count()
+        status, headers, _ = self._post("/fast/v1/chat/completions")
+        # /fast returns the local 429 (the race is never started) and the
+        # stub count does NOT grow.
+        self.assertEqual(status, 429,
+                         "/fast must short-circuit on an open circuit")
+        self.assertEqual(
+            self._received_count(), before,
+            "/fast must not race (contact the stub) when the circuit is open")
+        self.assertIn("retry-after", headers)
 
 if __name__ == "__main__":
     unittest.main()
