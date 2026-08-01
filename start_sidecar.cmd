@@ -8,6 +8,12 @@ set "LISTEN_PORT=8088"
 set "UPSTREAM=127.0.0.1:8080"
 set "LISTEN=127.0.0.1:%LISTEN_PORT%"
 
+rem --- initial sleep ---
+rem --- Dynamic Sleep Calculation ---
+for /f %%A in ('powershell -Command "$u = (New-TimeSpan -Start (Get-CimInstance Win32_OperatingSystem).LastBootUpTime -End (Get-Date)).TotalSeconds; $r = 120 - $u; if ($r -lt 3) { 3 } else { [math]::Round($r) }"') do set "sleep_duration=%%A"
+echo Sleeping for %sleep_duration% seconds...
+timeout /t %sleep_duration% /nobreak >nul
+
 rem --- pick a bind address: Tailscale IP when available, else localhost only ---
 set "TS_IP="
 for /f "delims=" %%I in ('tailscale ip -4 2^>nul ^| findstr /R /C:"^[0-9]"') do set "TS_IP=%%I"
