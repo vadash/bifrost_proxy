@@ -551,6 +551,34 @@ class TestCompletionToSse(unittest.TestCase):
         without_usage = self._events(completion_to_sse(completion, include_usage=False))
         self.assertNotIn("usage", without_usage[-1])
 
+    def test_wrapped_arguments_unwrapped(self):
+        # The vision-exp server double-wraps: sole-key and spurious-key
+        # variants. Replay must hand the client flat arguments.
+        completion = self._completion({
+            "role": "assistant", "content": None,
+            "tool_calls": [
+                {"id": "c1", "type": "function", "function": {"name": "read",
+                 "arguments": "{\"arguments\": {\"path\": \"/x\", \"i\": \"y\"}}"}},
+                {"id": "c2", "type": "function", "function": {"name": "edit",
+                 "arguments": "{\"path\": \"/x\", \"arguments\": {\"oldText\": \"a\"}}"}},
+            ],
+        })
+        events = self._events(completion_to_sse(completion, include_usage=False))
+        a1 = json.loads(events[1]["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"])
+        a2 = json.loads(events[2]["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"])
+        self.assertEqual(a1, {"path": "/x", "i": "y"})
+        self.assertEqual(a2, {"path": "/x", "oldText": "a"})
+
+    def test_clean_arguments_verbatim(self):
+        completion = self._completion({
+            "role": "assistant", "content": None,
+            "tool_calls": [{"id": "c1", "type": "function", "function": {
+                "name": "read", "arguments": "{\"path\": \"/x\"}"}}],
+        })
+        events = self._events(completion_to_sse(completion, include_usage=False))
+        raw = events[1]["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"]
+        self.assertEqual(json.loads(raw), {"path": "/x"})
+
     def test_garbage_returns_none(self):
         self.assertIsNone(completion_to_sse(b"not json", include_usage=False))
         self.assertIsNone(completion_to_sse(b"{}", include_usage=False))

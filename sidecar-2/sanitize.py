@@ -257,6 +257,28 @@ def downgrade_stream(body: dict) -> bool:
     return True
 
 
+def unwrap_tool_args(args) -> str:
+    """Repair the vision-exp server's double-wrapped tool-call arguments.
+
+    The server intermittently wraps the real fields inside a spurious
+    ``arguments`` key (sole-key or beside other fields). Flatten it; leave
+    anything else verbatim.
+    """
+    if not isinstance(args, str):
+        return args
+    try:
+        parsed = json.loads(args)
+    except ValueError:
+        return args
+    if (not isinstance(parsed, dict) or "arguments" not in parsed
+            or not isinstance(parsed["arguments"], dict)):
+        return args
+    # ponytail: drops a legit dict-valued param literally named
+    # "arguments"; omp tools have none. Per-tool schema check if one appears.
+    inner = parsed.pop("arguments")
+    return json.dumps({**parsed, **inner})
+
+
 def completion_to_sse(resp_body: bytes, include_usage: bool) -> bytes | None:
     """Replay a buffered non-streaming ``chat.completion`` as OpenAI SSE.
 
@@ -306,7 +328,7 @@ def completion_to_sse(resp_body: bytes, include_usage: bool) -> bytes | None:
                 "type": "function",
                 "function": {
                     "name": fn.get("name", ""),
-                    "arguments": fn.get("arguments", ""),
+                    "arguments": unwrap_tool_args(fn.get("arguments", "")),
                 },
             }]})
         emit_choice({}, choice.get("finish_reason"))
