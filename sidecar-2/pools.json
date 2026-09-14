@@ -49,7 +49,7 @@
         "nvidia-13",
         "nvidia-14",
         "nvidia-15"
-    ],    
+    ],
     "kilo-auto/free": [
         "kilo-01",
         "kilo-02",
@@ -65,5 +65,17 @@
         "kilo-04",
         "kilo-05",
         "kilo-06"
+    ],
+    "DeepSeek-V4.1-Flash": [
+        "amd-01",
+        "amd-02"
+    ],
+    "DeepSeek-V4-Flash-Vision-Exp": [
+        "amd-01",
+        "amd-02"
+    ],
+    "DeepSeek-V4-Flash": [
+        "amd-01",
+        "amd-02"
     ]
 }
