@@ -1,5 +1,5 @@
 {
-    "z-ai/glm-5.2": [
+    "moonshotai/kimi-k3": [
         "nvidia-1",
         "nvidia-2",
         "nvidia-3",
@@ -16,7 +16,7 @@
         "nvidia-14",
         "nvidia-15"
     ],
-    "thinkingmachines/inkling": [
+    "z-ai/glm-5.3-flash": [
         "nvidia-1",
         "nvidia-2",
         "nvidia-3",
@@ -33,7 +33,7 @@
         "nvidia-14",
         "nvidia-15"
     ],
-    "poolside/laguna-xs-2.1": [
+    "nvidia/nemotron-3-ultra-550b-a55b": [
         "nvidia-1",
         "nvidia-2",
         "nvidia-3",
@@ -49,8 +49,16 @@
         "nvidia-13",
         "nvidia-14",
         "nvidia-15"
-    ],
+    ],    
     "kilo-auto/free": [
+        "kilo-01",
+        "kilo-02",
+        "kilo-03",
+        "kilo-04",
+        "kilo-05",
+        "kilo-06"
+    ],
+    "tencent/hy3:free": [
         "kilo-01",
         "kilo-02",
         "kilo-03",
