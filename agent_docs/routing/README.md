@@ -44,7 +44,9 @@ fallback) — see **[fast-race-endpoint.md](fast-race-endpoint.md)**.
 6. **[request-sanitization.md](request-sanitization.md)** — why passthrough is
    no longer 100% verbatim: Bedrock 400s on empty `thinking` blocks and on
    OpenAI `reasoning_effort`, and `sidecar-2/sanitize.py` rewrites both for
-   claude/sonnet/opus models.
+   claude/sonnet/opus models; plus the DeepSeek-V4-Flash-Vision-Exp
+   streaming tool-call bug workaround (downgrade to non-streaming upstream,
+   replay the completion as synthesized SSE).
 7. **[fast-race-endpoint.md](fast-race-endpoint.md)** — `/fast/v1` two-lane
    race: lane construction, dual pins, winner selection, per-lane feedback.
 8. CORS: when started with `--cors` (Tailscale/tailnet bind),

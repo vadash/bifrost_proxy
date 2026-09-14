@@ -36,7 +36,14 @@ from .io_jsonl import JsonlWriter, parse_request_body
 from .pooled import apply_fast_feedback, apply_feedback, write_capture, write_decision_log
 from .predicates import is_sse_content_type
 from .routing_info import extract_provider
-from .sanitize import cap_max_tokens, model_needs_sanitize, sanitize_request_body
+from .sanitize import (
+    cap_max_tokens,
+    completion_to_sse,
+    downgrade_stream,
+    model_needs_sanitize,
+    model_needs_stream_downgrade,
+    sanitize_request_body,
+)
 from .state import RoutingState, plan_pooled_request
 
 
@@ -214,6 +221,8 @@ class Handler(BaseHTTPRequestHandler):
     # --- Core forwarding logic -----------------------------------------------
     def proxy(self):
         self._response_line_sent = False
+        self._replay_sse = False   # vision-exp stream downgrade: replay SSE
+        self._replay_usage = False # include_usage from the original request
         conn = None
         # `/fast/v1/...` races pooled models over two disjoint lanes; the
         # prefix is stripped and everything else flows through unchanged.
@@ -409,6 +418,15 @@ class Handler(BaseHTTPRequestHandler):
         if not isinstance(parsed, dict):
             return None
         changed = cap_max_tokens(parsed)
+        if (parsed.get("stream") and model_needs_stream_downgrade(parsed.get("model"))
+                and "/chat/completions" in self.path):
+            # Read before downgrade_stream pops stream_options.
+            self._replay_usage = bool(
+                (parsed.get("stream_options") or {}).get("include_usage"))
+        if downgrade_stream(parsed):
+            # Client wanted SSE; replay the completion back as SSE.
+            self._replay_sse = True
+            changed = True
         if model_needs_sanitize(parsed.get("model")):
             changed = sanitize_request_body(parsed) is not None or changed
         if not changed:
@@ -451,8 +469,15 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_cors_headers()
 
             # 6. Relay response headers except hop-by-hop and content-length.
+            # When replaying (vision-exp downgrade), swap the upstream JSON
+            # content-type for SSE -- the body below is synthesized chunks.
+            replay = self._replay_sse and response_status == 200
             for name, value in self._filter_response_headers(resp.getheaders()):
+                if replay and name.lower() == "content-type":
+                    continue
                 self.send_header(name, value)
+            if replay:
+                self.send_header("Content-Type", "text/event-stream")
 
             # Pooled-only: expose sidecar routing decision to the client.
             if pooled_headers is not None:
@@ -473,13 +498,23 @@ class Handler(BaseHTTPRequestHandler):
                     self.wfile.flush()
                     sse_buf.extend(chunk)
             else:
-                # Non-stream: buffer full body, send Content-Length.
+                # Non-stream: buffer full body.
                 resp_body = resp.read()
+                served_provider = extract_provider(resp_body, is_stream=False)
+                if replay:
+                    sse = completion_to_sse(resp_body, self._replay_usage)
+                    if sse is not None:
+                        self.send_header("Connection", "close")
+                        self.end_headers()
+                        self.wfile.write(sse)
+                        self.wfile.flush()
+                        return response_status, True, served_provider, retry_after
+                # Verbatim relay (also the replay fallback for a body that
+                # is not a parseable completion).
                 self.send_header("Content-Length", str(len(resp_body)))
                 self.send_header("Connection", "close")
                 self.end_headers()
                 self.wfile.write(resp_body)
-                served_provider = extract_provider(resp_body, is_stream=False)
 
             if is_stream:
                 served_provider = extract_provider(bytes(sse_buf), is_stream=True)

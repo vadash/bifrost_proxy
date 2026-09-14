@@ -214,4 +214,104 @@ def sanitize_request_body(parsed: dict) -> bytes | None:
     changed = mirror_max_tokens(parsed) or changed
     if not changed:
         return None
+
     return json.dumps(parsed).encode("utf-8")
+
+
+# --- DeepSeek-V4-Flash-Vision-Exp streaming downgrade -----------------------
+#
+# The vision-exp preview server's streaming tool-call parser intermittently
+# emits tool-call arguments wrapped one level too deep — the accumulated
+# arguments string parses to ``{"arguments": {...}}`` (or carries a spurious
+# ``arguments`` key beside the real fields) after any prior assistant tool
+# call in the conversation. Non-streaming responses are unaffected, so for
+# this model the proxy downgrades ``stream: true`` requests to non-streaming
+# upstream and replays the finished completion back to the client as
+# synthesized OpenAI SSE (``completion_to_sse``).
+
+# Lowercase substrings matched against the request's model name.
+_DOWNGRADE_MODEL_HINTS: tuple[str, ...] = ("deepseek-v4-flash-vision-exp",)
+
+
+def model_needs_stream_downgrade(model: object) -> bool:
+    """True when the model name looks like the vision-exp preview model."""
+    low = str(model).lower() if isinstance(model, str) else ""
+    return any(hint in low for hint in _DOWNGRADE_MODEL_HINTS)
+
+
+def downgrade_stream(body: dict) -> bool:
+    """Force ``stream: false`` for the vision-exp model. In-place.
+
+    Also drops ``stream_options`` (meaningless upstream once non-streaming);
+    the caller reads ``include_usage`` off the body BEFORE calling this when
+    it needs to replay a trailing usage chunk.
+
+    Returns True when the body was modified (caller re-serializes).
+    """
+    if not isinstance(body, dict) or not body.get("stream"):
+        return False
+    if not model_needs_stream_downgrade(body.get("model")):
+        return False
+    body["stream"] = False
+    body.pop("stream_options", None)
+    return True
+
+
+def completion_to_sse(resp_body: bytes, include_usage: bool) -> bytes | None:
+    """Replay a buffered non-streaming ``chat.completion`` as OpenAI SSE.
+
+    One chunk per logical piece (role+content, ``reasoning_content``,
+    each complete tool_call, finish_reason), an optional trailing usage
+    chunk, then ``data: [DONE]``. Clients accumulate deltas exactly as they
+    would from a native stream.
+
+    Returns ``None`` when ``resp_body`` is not a parseable completion with
+    choices — the caller then relays the body verbatim instead.
+    """
+    try:
+        completion = json.loads(resp_body)
+    except (ValueError, UnicodeDecodeError):
+        return None
+    if not isinstance(completion, dict) or not completion.get("choices"):
+        return None
+
+    base = {
+        "id": completion.get("id"),
+        "object": "chat.completion.chunk",
+        "created": completion.get("created"),
+        "model": completion.get("model"),
+    }
+
+
+    out = bytearray()
+    for choice in completion["choices"]:
+        idx = choice.get("index", 0)
+        msg = choice.get("message") or {}
+
+        def emit_choice(delta, finish_reason=None) -> None:
+            event = {**base, "choices": [
+                {"index": idx, "delta": delta, "finish_reason": finish_reason}
+            ]}
+            out.extend(b"data: " + json.dumps(event).encode("utf-8") + b"\n\n")
+
+        reasoning = msg.get("reasoning_content")
+        if reasoning:
+            emit_choice({"role": "assistant", "reasoning_content": reasoning})
+        emit_choice({"role": "assistant", "content": msg.get("content") or ""})
+        for i, tc in enumerate(msg.get("tool_calls") or []):
+            fn = tc.get("function") or {}
+            emit_choice({"tool_calls": [{
+                "id": tc.get("id"),
+                "index": i,
+                "type": "function",
+                "function": {
+                    "name": fn.get("name", ""),
+                    "arguments": fn.get("arguments", ""),
+                },
+            }]})
+        emit_choice({}, choice.get("finish_reason"))
+    if include_usage and completion.get("usage"):
+        event = {**base, "choices": [], "usage": completion["usage"]}
+        out.extend(b"data: " + json.dumps(event).encode("utf-8") + b"\n\n")
+    out.extend(b"data: [DONE]\n\n")
+    return bytes(out)

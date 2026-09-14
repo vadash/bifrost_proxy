@@ -139,3 +139,44 @@ the handler's `_sanitize_body(parsed)`:
   fields, the rewrite will need to be revisited.
 
 Tests: `python -m unittest discover -s sidecar-2.tests -v`.
+
+## Fix 4: DeepSeek-V4-Flash-Vision-Exp stream downgrade + SSE replay
+
+The vision-exp preview server's streaming tool-call parser intermittently
+emits tool-call arguments wrapped one level too deep: the accumulated
+`tool_calls[].function.arguments` string parses to `{"arguments": {...}}`
+(or carries a spurious `arguments` key beside the real fields) once the
+conversation history contains a prior assistant tool call. Strict client
+validators then reject every follow-up tool call. Non-streaming responses
+from the same server are unaffected, and the sibling
+`DeepSeek-V4-Flash-0731` does not exhibit the bug.
+
+Because the corruption only becomes visible after the client accumulates the
+full argument stream, it cannot be patched per-chunk. The sidecar therefore
+downgrades the request instead:
+
+1. `sanitize.py::downgrade_stream` — for model names containing
+   `deepseek-v4-flash-vision-exp` (case-insensitive) on a `/chat/completions`
+   path with `stream: true`: force `stream: false`, drop `stream_options`
+   (`include_usage` is read by the proxy BEFORE the pop).
+2. Upstream returns a normal buffered `chat.completion` (verified clean).
+3. `sanitize.py::completion_to_sse` replays it to the client as synthesized
+   OpenAI SSE (`text/event-stream`): role+content chunk, `reasoning_content`
+   chunk (when present), one chunk per complete tool_call, finish chunk,
+   optional trailing usage chunk (when the client asked
+   `include_usage`), then `data: [DONE]`. Client-side accumulation sees a
+   well-formed stream with flat arguments.
+
+Scope guards: only OpenAI-format `/chat/completions` requests; a non-200 or
+unparseable upstream body falls back to verbatim relay. Anthropic-format
+`/v1/messages` passthrough is untouched (replay would emit the wrong event
+shape). `/fast` never triggers: the downgrade only fires in
+`_sanitize_body`, and vision-exp is not a pooled model.
+
+Cost: TTFT for this one model becomes time-to-full-response (the sidecar
+buffers the whole completion before the first byte). That is the trade —
+correct tool calls beat incremental display.
+
+Tests: `sidecar-2/tests/test_sanitize.py::TestStreamDowngrade` and
+`TestCompletionToSse`. A live-API repro harness lives at `C:/tmp/dsbug_loop.py`
+(not CI — it hits the real gateway).

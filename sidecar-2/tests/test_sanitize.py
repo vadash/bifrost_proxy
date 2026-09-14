@@ -17,8 +17,11 @@ import unittest
 # load the module via importlib.
 _sanitize = importlib.import_module("sidecar-2.sanitize")
 cap_max_tokens = _sanitize.cap_max_tokens
+completion_to_sse = _sanitize.completion_to_sse
+downgrade_stream = _sanitize.downgrade_stream
 mirror_max_tokens = _sanitize.mirror_max_tokens
 model_needs_sanitize = _sanitize.model_needs_sanitize
+model_needs_stream_downgrade = _sanitize.model_needs_stream_downgrade
 rewrite_reasoning_effort = _sanitize.rewrite_reasoning_effort
 sanitize_request_body = _sanitize.sanitize_request_body
 strip_empty_thinking = _sanitize.strip_empty_thinking
@@ -440,6 +443,123 @@ class TestSanitizeRequestBody(unittest.TestCase):
         # the orchestrator must short-circuit to ``None`` rather than raise.
         self.assertIsNone(sanitize_request_body({}))
         self.assertIsNone(sanitize_request_body({"messages": []}))
+
+
+class TestStreamDowngrade(unittest.TestCase):
+    """``downgrade_stream`` — vision-exp stream:true forced to false.
+
+    Guards the workaround for the vision-exp preview server's streaming
+    tool-call parser bug (intermittently double-wraps accumulated tool-call
+    arguments as ``{"arguments": {...}}``); non-streaming responses are
+    clean, so the proxy downgrades and replays SSE.
+    """
+
+    def test_vision_exp_stream_downgraded(self):
+        for m in ("DeepSeek-V4-Flash-Vision-Exp",
+                  "amd0/DeepSeek-V4-Flash-Vision-Exp",
+                  "deepseek-v4-flash-vision-exp"):
+            with self.subTest(model=m):
+                body = {"model": m, "stream": True,
+                        "stream_options": {"include_usage": True},
+                        "messages": [_msg("user", "hi")]}
+                self.assertTrue(downgrade_stream(body))
+                self.assertFalse(body["stream"])
+                self.assertNotIn("stream_options", body)
+
+    def test_other_models_untouched(self):
+        # DeepSeek-V4-Flash-0731 (the fixed sibling) must keep streaming.
+        for m in ("DeepSeek-V4-Flash-0731", "deepseek-v4", "gpt-5",
+                  "claude-opus-4-8", "z-ai/glm-5.2"):
+            with self.subTest(model=m):
+                body = {"model": m, "stream": True}
+                self.assertFalse(downgrade_stream(body))
+                self.assertTrue(body["stream"])
+
+    def test_non_stream_noop(self):
+        for body in ({"model": "DeepSeek-V4-Flash-Vision-Exp"},
+                     {"model": "DeepSeek-V4-Flash-Vision-Exp", "stream": False},
+                     {}):
+            with self.subTest(body=body):
+                self.assertFalse(downgrade_stream(body))
+
+    def test_model_gate(self):
+        self.assertTrue(model_needs_stream_downgrade("AMD0/DeepSeek-V4-Flash-Vision-Exp"))
+        self.assertFalse(model_needs_stream_downgrade("DeepSeek-V4-Flash-0731"))
+        self.assertFalse(model_needs_stream_downgrade(None))
+
+
+class TestCompletionToSse(unittest.TestCase):
+    """``completion_to_sse`` — buffered completion replayed as OpenAI SSE."""
+
+    @staticmethod
+    def _events(sse):
+        return [json.loads(line[len("data: "):])
+                for line in sse.decode().split("\n\n")
+                if line.startswith("data: ") and line != "data: [DONE]"]
+
+    def _completion(self, message, **extra):
+        return json.dumps({"id": "c1", "object": "chat.completion",
+                           "created": 1, "model": "m",
+                           "choices": [{"index": 0, "message": message,
+                                        "finish_reason": "tool_calls"}], **extra}).encode()
+
+    def test_tool_calls_replayed_flat_and_complete(self):
+        completion = self._completion({
+            "role": "assistant", "content": None,
+            "tool_calls": [
+                {"id": "call_1", "type": "function",
+                 "function": {"name": "get_file",
+                              "arguments": "{\"filePath\": \"/etc/os-release\"}"}},
+                {"id": "call_2", "type": "function",
+                 "function": {"name": "get_file",
+                              "arguments": "{\"filePath\": \"/etc/hostname\"}"}},
+            ],
+        })
+        events = self._events(completion_to_sse(completion, include_usage=False))
+        # role+content, one chunk per tool_call, finish chunk.
+        self.assertEqual(len(events), 4)
+        self.assertEqual(events[0]["choices"][0]["delta"],
+                         {"role": "assistant", "content": ""})
+        args = [e["choices"][0]["delta"]["tool_calls"][0] for e in events[1:3]]
+        self.assertEqual([a["id"] for a in args], ["call_1", "call_2"])
+        self.assertEqual([a["index"] for a in args], [0, 1])
+        # The replayed arguments are the client-visible contract: each
+        # tool_call must carry its complete, flat, valid-JSON argument
+        # string — never the server's double-wrapped shape.
+        for a in args:
+            self.assertEqual(a["type"], "function")
+            parsed = json.loads(a["function"]["arguments"])
+            self.assertIn("filePath", parsed)
+            self.assertNotIn("arguments", parsed)
+        self.assertEqual(events[3]["choices"][0]["finish_reason"], "tool_calls")
+        self.assertTrue(events[-1]["choices"][0]["delta"] == {})
+
+    def test_reasoning_and_content_order(self):
+        completion = self._completion({"role": "assistant",
+                                       "reasoning_content": "thinking",
+                                       "content": "answer"})
+        events = self._events(completion_to_sse(completion, include_usage=False))
+        self.assertEqual(events[0]["choices"][0]["delta"]["reasoning_content"], "thinking")
+        self.assertEqual(events[1]["choices"][0]["delta"]["content"], "answer")
+
+    def test_usage_chunk_gated_on_include_usage(self):
+        completion = self._completion({"role": "assistant", "content": "x"},
+                                      usage={"total_tokens": 7})
+        with_usage = self._events(completion_to_sse(completion, include_usage=True))
+        self.assertEqual(with_usage[-1]["choices"], [])
+        self.assertEqual(with_usage[-1]["usage"]["total_tokens"], 7)
+        without_usage = self._events(completion_to_sse(completion, include_usage=False))
+        self.assertNotIn("usage", without_usage[-1])
+
+    def test_garbage_returns_none(self):
+        self.assertIsNone(completion_to_sse(b"not json", include_usage=False))
+        self.assertIsNone(completion_to_sse(b"{}", include_usage=False))
+        self.assertIsNone(completion_to_sse(b'{"choices": []}', include_usage=False))
+
+    def test_done_sentinel_always_last(self):
+        sse = completion_to_sse(self._completion({"role": "assistant", "content": "x"}),
+                                include_usage=False)
+        self.assertTrue(sse.decode().endswith("data: [DONE]\n\n"))
 
 
 if __name__ == "__main__":
