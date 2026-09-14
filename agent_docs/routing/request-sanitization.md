@@ -159,13 +159,17 @@ downgrades the request instead:
    `deepseek-v4-flash-vision-exp` (case-insensitive) on a `/chat/completions`
    path with `stream: true`: force `stream: false`, drop `stream_options`
    (`include_usage` is read by the proxy BEFORE the pop).
-2. Upstream returns a normal buffered `chat.completion` (verified clean).
-3. `sanitize.py::completion_to_sse` replays it to the client as synthesized
-   OpenAI SSE (`text/event-stream`): role+content chunk, `reasoning_content`
-   chunk (when present), one chunk per complete tool_call, finish chunk,
-   optional trailing usage chunk (when the client asked
-   `include_usage`), then `data: [DONE]`. Client-side accumulation sees a
-   well-formed stream with flat arguments.
+2. Upstream returns a normal buffered `chat.completion`. The wrap can still
+   appear here on large conversations.
+3. `sanitize.py::completion_to_sse` repairs each tool_call
+   (`unwrap_tool_args`: a spurious `arguments` key holding the real
+   fields — sole-key or beside other fields — is flattened; anything else
+   passes verbatim), then replays the completion as synthesized OpenAI SSE
+   (`text/event-stream`): role+content chunk, `reasoning_content` chunk
+   (when present), one chunk per complete tool_call, finish chunk, optional
+   trailing usage chunk (when the client asked `include_usage`), then
+   `data: [DONE]`. Client-side accumulation sees a well-formed stream with
+   flat arguments.
 
 Scope guards: only OpenAI-format `/chat/completions` requests; a non-200 or
 unparseable upstream body falls back to verbatim relay. Anthropic-format
